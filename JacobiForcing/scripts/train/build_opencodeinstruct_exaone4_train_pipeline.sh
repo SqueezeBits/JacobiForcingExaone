@@ -10,7 +10,7 @@ set -euo pipefail
 #   source /opt/miniforge3/etc/profile.d/conda.sh
 #   conda activate jacobi
 #   OPENCODE_INPUT_DIR=/path/to/opencodeinstruct_jsonl_dir \
-#   bash JacobiForcing/scripts/exaone4/build_opencodeinstruct_exaone4_train_pipeline.sh
+#   bash JacobiForcing/scripts/train/build_opencodeinstruct_exaone4_train_pipeline.sh
 #
 # Resume examples:
 #   START_STAGE=3 bash .../build_opencodeinstruct_exaone4_train_pipeline.sh

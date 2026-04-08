@@ -15,7 +15,7 @@ set -euo pipefail
 
 # ===== Config =====
 json_files=(
-    "/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/sample_prompts_small.json"
+    "/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/tool/sample_prompts_small.json"
 )
 
 save_path="/workspace/exaone_workspace/JacobiForcing/tmp/exaone4_generated_trajectory_blk32"

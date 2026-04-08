@@ -6,13 +6,13 @@ BLOCK_SIZE="${BLOCK_SIZE:-8}"
 WINDOW_SIZE="${WINDOW_SIZE:-4}"
 MAX_NEW_SEQ_LEN="${MAX_NEW_SEQ_LEN:-8}"
 PROMPT_FILE="${PROMPT_FILE:-}"
-OUT_DIR="${OUT_DIR:-/workspace/exaone_workspace/JacobiForcing/tmp/exaone4_tiny_trainset}"
+OUT_DIR="${OUT_DIR:-${OUT_ROOT:-/workspace/exaone_workspace/JacobiForcing/tmp/exaone4_tiny_trainset}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 if [[ -z "${PROMPT_FILE}" ]]; then
-  PROMPT_FILE="${SCRIPT_DIR}/sample_prompts_small.json"
+  PROMPT_FILE="${SCRIPT_DIR}/../tool/sample_prompts_small.json"
 fi
 
 mkdir -p "${OUT_DIR}"

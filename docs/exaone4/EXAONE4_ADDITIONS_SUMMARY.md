@@ -67,7 +67,7 @@
 
 ## 1.3 EXAONE4 검증 스크립트
 
-### [smoke_test_exaone4.py](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/smoke_test_exaone4.py)
+### [smoke_test_exaone4.py](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/tool/smoke_test_exaone4.py)
 
 - EXAONE4 config / tokenizer / model load 테스트
 - chat template
@@ -75,15 +75,15 @@
 - generation
 - optional backward
 
-### [run_smoke_test_exaone4.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/run_smoke_test_exaone4.sh)
+### [run_smoke_test_exaone4.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/tool/run_smoke_test_exaone4.sh)
 
 - smoke test 실행 wrapper
 
-### [validate_exaone4_jacobi_greedy.py](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/validate_exaone4_jacobi_greedy.py)
+### [validate_exaone4_jacobi_greedy.py](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/tool/validate_exaone4_jacobi_greedy.py)
 
 - EXAONE4 greedy Jacobi block 결과가 AR greedy prefix와 일치하는지 검증
 
-### [validate_exaone4_training_step.py](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/validate_exaone4_training_step.py)
+### [validate_exaone4_training_step.py](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/tool/validate_exaone4_training_step.py)
 
 - packed sample을 EXAONE4에 넣어 Jacobi Forcing 스타일 loss 계산 확인
 - optional backward로 grad 생성 확인
@@ -92,19 +92,19 @@
 
 ## 1.4 OpenCodeInstruct / tiny dataset 보조 스크립트
 
-### [download_opencodeinstruct_to_jsonl.py](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/download_opencodeinstruct_to_jsonl.py)
+### [download_opencodeinstruct_to_jsonl.py](/workspace/exaone_workspace/JacobiForcing/generate_trajectory/data/download_opencodeinstruct_to_jsonl.py)
 
 - `nvidia/OpenCodeInstruct`를 HF에서 받아 JSONL shard로 저장
 
-### [sample_prompts_small.json](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/sample_prompts_small.json)
+### [sample_prompts_small.json](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/tool/sample_prompts_small.json)
 
 - 작은 EXAONE4 trajectory / training smoke test용 샘플 prompt 세트
 
-### [build_tiny_exaone4_trainset.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/build_tiny_exaone4_trainset.sh)
+### [build_tiny_exaone4_trainset.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/train/build_tiny_exaone4_trainset.sh)
 
 - tiny prompt 세트 -> trajectory -> packed data까지 end-to-end
 
-### [build_opencodeinstruct_exaone4_train_pipeline.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/build_opencodeinstruct_exaone4_train_pipeline.sh)
+### [build_opencodeinstruct_exaone4_train_pipeline.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/train/build_opencodeinstruct_exaone4_train_pipeline.sh)
 
 - OpenCodeInstruct JSONL dir -> bucket -> trajectory -> packed data end-to-end
 - `START_STAGE` resume 지원
@@ -112,7 +112,7 @@
 - GPU 수 자동 감지
 - `BATCH_SIZE` 지원
 
-### [run_generate_exaone4_trajectory.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/run_generate_exaone4_trajectory.sh)
+### [run_generate_exaone4_trajectory.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/tool/run_generate_exaone4_trajectory.sh)
 
 - 단일 입력 파일 기준 trajectory generation wrapper
 
@@ -254,11 +254,11 @@ EXAONE4
 
 ### OpenCodeInstruct JSONL 받기
 
-- [download_opencodeinstruct_to_jsonl.py](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/download_opencodeinstruct_to_jsonl.py)
+- [download_opencodeinstruct_to_jsonl.py](/workspace/exaone_workspace/JacobiForcing/generate_trajectory/data/download_opencodeinstruct_to_jsonl.py)
 
 ### OpenCodeInstruct -> bucket -> trajectory -> packed
 
-- [build_opencodeinstruct_exaone4_train_pipeline.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/build_opencodeinstruct_exaone4_train_pipeline.sh)
+- [build_opencodeinstruct_exaone4_train_pipeline.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/train/build_opencodeinstruct_exaone4_train_pipeline.sh)
 
 ### EXAONE4 trajectory만 단일 파일 기준으로 생성
 
@@ -266,7 +266,7 @@ EXAONE4
 
 ### 작은 샘플 end-to-end
 
-- [build_tiny_exaone4_trainset.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/exaone4/build_tiny_exaone4_trainset.sh)
+- [build_tiny_exaone4_trainset.sh](/workspace/exaone_workspace/JacobiForcing/JacobiForcing/scripts/train/build_tiny_exaone4_trainset.sh)
 
 ---
 
