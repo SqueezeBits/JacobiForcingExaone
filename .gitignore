@@ -1,5 +1,6 @@
 data/collected_diffusion_trajectory/*
-*/__pycache__
+*/__pycache__/
+*.pyc
 cllm2
 cllm2_venv
 wandb
@@ -11,3 +12,4 @@ tmp/
 *.jsonl
 profiling_results/*
 logs/*
+.DS_Store
