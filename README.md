@@ -24,6 +24,15 @@
     <img src="https://flat.badgen.net/badge/Tutorial/Quickstart/green" alt="Tutorial">
 </p>
 
+> This repository is a fork of the original `hao-ai-lab/JacobiForcing` project.
+> The upstream repository remains the source of the original paper implementation.
+> This fork adds EXAONE / K-EXAONE specific workflows, validation scripts, and Megatron/NeMo migration scaffolds.
+
+## Fork-Specific Docs
+
+- EXAONE / K-EXAONE docs index: [`docs/exaone4/README.md`](docs/exaone4/README.md)
+- Repository analysis: [`docs/JACOBI_FORCING_REPO_ANALYSIS.md`](docs/JACOBI_FORCING_REPO_ANALYSIS.md)
+
 
 ##
 

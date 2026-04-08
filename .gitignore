@@ -13,3 +13,4 @@ tmp/
 profiling_results/*
 logs/*
 .DS_Store
+.pixi/

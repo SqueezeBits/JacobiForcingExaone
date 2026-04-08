@@ -1,0 +1,28 @@
+[project]
+name = "jacobi-forcing-k-exaone"
+version = "0.1.0"
+description = "Forked Jacobi Forcing workflow for K-EXAONE with vLLM data generation and Megatron/NeMo training scaffolds."
+authors = ["OpenAI Codex"]
+channels = ["conda-forge", "nvidia"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.12,<3.13"
+pip = ">=24"
+git = ">=2.40"
+
+[pypi-dependencies]
+torch = ">=2.10.0"
+transformers = ">=5.5,<5.6"
+datasets = ">=3.6.0"
+accelerate = ">=1.8.1"
+peft = ">=0.15.2"
+deepspeed = ">=0.17.1"
+vllm = "==0.19.0"
+megatron-bridge = ">=0.2.0"
+nemo-toolkit = ">=2.2.0"
+
+[tasks]
+data = "bash JacobiForcing/scripts/data/build_k_exaone_vllm_trainset.sh"
+train-lora = "bash JacobiForcing/scripts/train/train_k_exaone_bridge_lora.sh"
+train-full = "bash JacobiForcing/scripts/train/train_k_exaone_bridge_full.sh"
