@@ -1,0 +1,8 @@
+[
+  "Write a short Python function named fib(n) that returns the nth Fibonacci number. Return code only.",
+  "Write a Python function named is_prime(n) that returns True if n is prime and False otherwise. Return code only.",
+  "Write a Python function named reverse_words(text) that reverses the order of words in a string. Return code only.",
+  "Write a Python function named two_sum(nums, target) that returns the indices of two numbers summing to target. Return code only.",
+  "Write a Python function named merge_sorted(a, b) that merges two sorted lists into one sorted list. Return code only.",
+  "Write a Python function named count_vowels(text) that counts vowels in a string. Return code only."
+]

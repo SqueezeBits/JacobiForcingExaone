@@ -4,10 +4,10 @@ cllm2
 cllm2_venv
 wandb
 ckpts
+tmp/
 *.png
 *.csv
 *.txt
 *.jsonl
 profiling_results/*
 logs/*
-

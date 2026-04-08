@@ -27,13 +27,14 @@ from typing import List, Dict, Any, Optional
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-TOKENIZER_PATH: Optional[str] = "/checkpoint/lhu/models/Qwen2.5-Coder-7B-Instruct"  # set from CLI in main()
+TOKENIZER_PATH: Optional[str] = "/checkpoint/lhu/models/Qwen2.5-Coder-7B-Instruct"  # overridden from CLI in main()
 TOKENIZER = None                      # global per worker
 
 
-def init_worker():
+def init_worker(tokenizer_path: str):
     """Initialise the global tokenizer once per worker."""
-    global TOKENIZER
+    global TOKENIZER, TOKENIZER_PATH
+    TOKENIZER_PATH = tokenizer_path
     if TOKENIZER is None:
         if not TOKENIZER_PATH:
             raise RuntimeError("TOKENIZER_PATH not set in worker.")
@@ -55,12 +56,22 @@ def tokenize_pair(user_text: str, assistant_text: str) -> Optional[int]:
                 add_generation_prompt=False,
                 return_tensors="pt",
             )
-            .squeeze(0)
-            .tolist()
         )
+        if isinstance(ids, dict):
+            ids = ids["input_ids"]
+        elif hasattr(ids, "data") and isinstance(ids.data, dict):
+            ids = ids["input_ids"]
+
+        if hasattr(ids, "squeeze"):
+            ids = ids.squeeze(0).tolist()
+        elif isinstance(ids, list):
+            if ids and isinstance(ids[0], list):
+                ids = ids[0]
+        else:
+            raise TypeError(f"Unsupported tokenized output type: {type(ids)}")
         return len(ids)
     except Exception as e:
-        print("⚠️  Tokenization error:", e)
+        print("⚠️  Tokenization error:", repr(e))
         return None
 
 
@@ -117,7 +128,7 @@ def main(input_path: str,
     samples = load_all_records(input_path)
 
     # 2) Token-count each sample in parallel -----------------------------------------------------
-    with mp.Pool(n_workers, initializer=init_worker) as pool:
+    with mp.Pool(n_workers, initializer=init_worker, initargs=(TOKENIZER_PATH,)) as pool:
         processed = list(
             tqdm(
                 pool.imap(partial(process_sample), samples),
