@@ -32,6 +32,8 @@ Qwen2ForCausalLM.jacobi_forward_greedy_multiblock = jacobi_forward_greedy_multib
 # JSONL utilities
 # ---------------------------
 def load_jsonl(file_path):
+    if not os.path.exists(file_path):
+        return []
     with open(file_path, "r") as f:
         return [json.loads(line.strip()) for line in f]
 

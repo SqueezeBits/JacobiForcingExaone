@@ -49,6 +49,8 @@ def set_seed(seed: int):
 
 
 def load_jsonl(file_path):
+    if not os.path.exists(file_path):
+        return []
     with open(file_path, 'r') as f:
         return [json.loads(line.strip()) for line in f]
 
@@ -183,29 +185,45 @@ def main():
                 print(f"====[{idx+1}/{len(records)}] task_id={task_id} "
                       f"new_toks={new_tokens} gen_time={gen_time:.2f}s toks/sec={toks_per_sec:.2f} "
                       f"reason={stop_reason}====")
-            
-            break
+
 
     t_overall = time.perf_counter() - t0_overall
 
     # ---------------------------
     # Save generations as JSONL
     # ---------------------------
-    original_generations = load_jsonl(args.original_jsonl)
+    original_generations = []
+    if args.original_jsonl and os.path.exists(args.original_jsonl):
+        original_generations = load_jsonl(args.original_jsonl)
+    else:
+        print(f"[WARN] original_jsonl not found: {args.original_jsonl}. Saving generated outputs without template rows.")
+
     if len(original_generations) != len(all_generations):
         print(f"[WARN] original_jsonl has {len(original_generations)} entries, but we produced {len(all_generations)}.")
 
-    for i, original in enumerate(original_generations[:len(all_generations)]):
-        original['output'] = all_generations[i]
-        code_only = extract_python_code(all_generations[i])
-        print(f"Task id: {i}, Extracted answer:\n{code_only}\n")
-        original['generation'] = code_only
+    if original_generations:
+        save_rows = original_generations[:len(all_generations)]
+        for i, original in enumerate(save_rows):
+            original['output'] = all_generations[i]
+            code_only = extract_python_code(all_generations[i])
+            print(f"Task id: {i}, Extracted answer:\n{code_only}\n")
+            original['generation'] = code_only
+    else:
+        save_rows = []
+        for row_meta, generation in zip(records, all_generations):
+            code_only = extract_python_code(generation)
+            save_rows.append({
+                "task_id": row_meta.get("task_id"),
+                "prompt": row_meta.get("prompt"),
+                "output": generation,
+                "generation": code_only,
+            })
 
     ar_save_path = os.path.join(
         args.eval_dir,
         f"ar_code_only_prompt_humaneval_generation_{Path(args.model_name).name}.jsonl"
     )
-    save_jsonl(original_generations[:len(all_generations)], ar_save_path)
+    save_jsonl(save_rows, ar_save_path)
     print(f"\n=== All AR generations done (HumanEval). Results are saved to {ar_save_path} ===")
 
     df_profile = pd.DataFrame(all_rows)

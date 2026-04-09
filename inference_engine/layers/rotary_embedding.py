@@ -48,7 +48,34 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
+def _normalize_rope_scaling(rope_scaling):
+    if rope_scaling is None:
+        return None
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+        # The current engine only supports the default RoPE path. Treat default-style
+        # configs as equivalent to no scaling so model init does not fail on dict inputs.
+        if rope_type in (None, "default"):
+            return None
+        return tuple(sorted(rope_scaling.items()))
+    if isinstance(rope_scaling, (list, tuple)):
+        return tuple(rope_scaling)
+    return rope_scaling
+
+
 @lru_cache(1)
+def _get_rope_cached(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling = None,
+):
+    assert rope_scaling is None, f"Unsupported rope_scaling in inference engine: {rope_scaling}"
+    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    return rotary_emb
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -56,6 +83,10 @@ def get_rope(
     base: float,
     rope_scaling: dict | None = None,
 ):
-    assert rope_scaling is None
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return rotary_emb
+    return _get_rope_cached(
+        head_size=head_size,
+        rotary_dim=rotary_dim,
+        max_position=max_position,
+        base=base,
+        rope_scaling=_normalize_rope_scaling(rope_scaling),
+    )

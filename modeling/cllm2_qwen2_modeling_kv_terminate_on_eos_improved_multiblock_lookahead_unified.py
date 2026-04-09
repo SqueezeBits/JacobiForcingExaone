@@ -35,26 +35,12 @@ import torch
 # --- optimized KV trimmer ---
 def _delete_false_key_value(self: DynamicCache, num_of_false_tokens: int) -> None:
     # No-op guards
-    if num_of_false_tokens <= 0 or not self.key_cache:
+    if num_of_false_tokens <= 0 or len(self.layers) == 0:
         return
-
-    kc, vc = self.key_cache, self.value_cache
-    # Infer current seq_len from the first layer; all layers align in HF caches
-    cur_len = kc[0].size(-2)
-    if num_of_false_tokens >= cur_len:
-        # Share a zero-length view across all layers
-        empty_k = kc[0].narrow(-2, 0, 0)
-        empty_v = vc[0].narrow(-2, 0, 0)
-        for i in range(len(kc)):
-            kc[i] = empty_k
-            vc[i] = empty_v
+    cur_len = self.get_seq_length()
+    if cur_len == 0:
         return
-
-    new_len = cur_len - num_of_false_tokens
-    # Use .narrow (view) rather than negative slicing; compute once, apply to all layers
-    for i in range(len(kc)):
-        kc[i] = kc[i].narrow(-2, 0, new_len)
-        vc[i] = vc[i].narrow(-2, 0, new_len)
+    self.crop(max(cur_len - num_of_false_tokens, 0))
 
 DynamicCache.delete_false_key_value = _delete_false_key_value
 
@@ -97,43 +83,38 @@ def _resize_dynamic_cache_batch(cache: DynamicCache, new_B: int) -> DynamicCache
     - Grow from k>1 -> new_B via repeat (tile rows).
     - Shrink from k>new_B -> new_B via slicing [:new_B].
     """
-    if len(cache.key_cache) == 0:
+    if len(cache.layers) == 0:
         return cache
-
-    cur_B = cache.key_cache[0].size(0)
+    first_layer = next((layer for layer in cache.layers if getattr(layer, "is_initialized", False)), None)
+    if first_layer is None or first_layer.keys.numel() == 0:
+        return cache
+    cur_B = first_layer.keys.size(0)
     if cur_B == new_B:
         return cache
 
-    for i in range(len(cache.key_cache)):
-        k = cache.key_cache[i]
-        v = cache.value_cache[i]
-
-        if new_B > cur_B:
-            if cur_B == 1:
-                # broadcast
-                cache.key_cache[i]   = k.expand(new_B, -1, -1, -1).contiguous()
-                cache.value_cache[i] = v.expand(new_B, -1, -1, -1).contiguous()
-            else:
-                # tile rows
-                reps = (new_B + cur_B - 1) // cur_B
-                k_rep = k.repeat(reps, 1, 1, 1)[:new_B]
-                v_rep = v.repeat(reps, 1, 1, 1)[:new_B]
-                cache.key_cache[i]   = k_rep.contiguous()
-                cache.value_cache[i] = v_rep.contiguous()
-        else:
-            # shrink by slicing
-            cache.key_cache[i]   = k[:new_B].contiguous()
-            cache.value_cache[i] = v[:new_B].contiguous()
+    device = first_layer.keys.device
+    if new_B > cur_B:
+        reps = (new_B + cur_B - 1) // cur_B
+        cache.batch_repeat_interleave(reps)
+    indices = torch.arange(new_B, device=device)
+    cache.batch_select_indices(indices)
     return cache
 
 
 def _expand_dynamic_cache_to_batch(cache: DynamicCache, new_B: int) -> DynamicCache:
     # Repeat KV along batch for speculative candidates
-    for i in range(len(cache.key_cache)):
-        k = cache.key_cache[i]
-        v = cache.value_cache[i]
-        cache.key_cache[i]  = k.expand(new_B, -1, -1, -1).contiguous()
-        cache.value_cache[i] = v.expand(new_B, -1, -1, -1).contiguous()
+    if len(cache.layers) == 0:
+        return cache
+    first_layer = next((layer for layer in cache.layers if getattr(layer, "is_initialized", False)), None)
+    if first_layer is None or first_layer.keys.numel() == 0:
+        return cache
+    cur_B = first_layer.keys.size(0)
+    if cur_B == new_B:
+        return cache
+    reps = (new_B + cur_B - 1) // cur_B
+    cache.batch_repeat_interleave(reps)
+    indices = torch.arange(new_B, device=first_layer.keys.device)
+    cache.batch_select_indices(indices)
     return cache
 
 
@@ -190,10 +171,10 @@ def jacobi_forward_greedy_multiblock(
         if not isinstance(causal_mask_mapping := attention_mask, dict):
             mask_kwargs = {
                 "config": self.config,
-                "input_embeds": inputs_embeds,
+                "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
+                "position_ids": position_ids,
             }
             causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
             if self.model.has_sliding_layers:
@@ -201,16 +182,15 @@ def jacobi_forward_greedy_multiblock(
 
         hidden_states = inputs_embeds
         position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
-        for decoder_layer in self.model.layers:
+        for i, decoder_layer in enumerate(self.model.layers[: self.model.config.num_hidden_layers]):
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=causal_mask_mapping[self.config.layer_types[i]],
                 position_ids=position_ids,
-                past_key_value=past_key_values,
+                past_key_values=past_key_values,
                 use_cache=use_cache,
-                cache_position=cache_position,
                 position_embeddings=position_embeddings,
-            )[0]
+            )
 
         hidden_states = self.model.norm(hidden_states)
         logits = self.lm_head(hidden_states).float()
@@ -312,7 +292,12 @@ def jacobi_forward_greedy_multiblock(
         return x_tiled[:B_target, :].contiguous()
 
     def _kv_batch_size(cache: DynamicCache) -> Optional[int]:
-        return cache.key_cache[0].size(0) if len(cache.key_cache) > 0 else None
+        if len(cache.layers) == 0:
+            return None
+        first_layer = next((layer for layer in cache.layers if getattr(layer, "is_initialized", False)), None)
+        if first_layer is None or first_layer.keys.numel() == 0:
+            return None
+        return first_layer.keys.size(0)
 
     def build_out_and_spans() -> Tuple[torch.Tensor, List[Tuple[int,int,int]]]:
         """
@@ -438,10 +423,10 @@ def jacobi_forward_greedy_multiblock(
         if not isinstance(causal_mask_mapping := out_attention_mask, dict):
             mask_kwargs = {
                 "config": self.config,
-                "input_embeds": inputs_embeds,
+                "inputs_embeds": inputs_embeds,
                 "attention_mask": out_attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
+                "position_ids": pos_ids,
             }
             causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
             if self.model.has_sliding_layers:
@@ -449,16 +434,15 @@ def jacobi_forward_greedy_multiblock(
 
         hidden_states = inputs_embeds
         pos_emb = self.model.rotary_emb(hidden_states, pos_ids)
-        for decoder_layer in self.model.layers[: self.model.config.num_hidden_layers]:
+        for i, decoder_layer in enumerate(self.model.layers[: self.model.config.num_hidden_layers]):
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=causal_mask_mapping[self.config.layer_types[i]],
                 position_ids=pos_ids,
-                past_key_value=past_key_values,
+                past_key_values=past_key_values,
                 use_cache=True,
-                cache_position=cache_position,
                 position_embeddings=pos_emb,
-            )[0]
+            )
         hidden_states = self.model.norm(hidden_states)
         logits = self.lm_head(hidden_states).float()
         # ==================================================
@@ -497,9 +481,9 @@ def jacobi_forward_greedy_multiblock(
             #print(f"draft size: {draft.size()}")
             block_logits = block_logits[best_idx:best_idx+1, :, :].contiguous()
             greedy = greedy[best_idx:best_idx+1, :].contiguous()
-            for i in range(len(past_key_values.key_cache)):
-                past_key_values.key_cache[i]  = past_key_values.key_cache[i][best_idx:best_idx+1].contiguous()
-                past_key_values.value_cache[i] = past_key_values.value_cache[i][best_idx:best_idx+1].contiguous()
+            if len(past_key_values.layers) > 0:
+                keep_idx = torch.tensor([best_idx], device=draft.device)
+                past_key_values.batch_select_indices(keep_idx)
                               
             #else:
             #    acc_len_raw = int((mismatch.cumsum(dim=-1) == 0).sum(dim=-1)[0]) + 1

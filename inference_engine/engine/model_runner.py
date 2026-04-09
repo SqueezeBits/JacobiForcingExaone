@@ -416,7 +416,9 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
             if hasattr(self, 'jacobi_graphs'):
-                del self.jacobi_graphs, self.jacobi_graph_pool, self.jacobi_graph_vars
+                del self.jacobi_graphs, self.jacobi_graph_pool
+                if hasattr(self, 'jacobi_graph_vars'):
+                    del self.jacobi_graph_vars
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -1620,41 +1622,67 @@ class ModelRunner:
         
         self.jacobi_graphs = {}
         self.jacobi_graph_pool = None
-        
-        for bs in reversed(graph_bs):
-            for L in graph_block_lens:
-                total_tokens = bs * L
-                
-                graph = torch.cuda.CUDAGraph()
-                
-                set_context(
-                    is_prefill=True,
-                    slot_mapping=slot_mapping[:total_tokens],
-                    block_tables=block_tables[:bs],
-                    cache_seqlens=cache_seqlens[:bs],
-                    seqlen_q=L,
-                    is_jacobi_graphed=True
-                )
-                
-                outputs[:total_tokens] = self.model(input_ids[:total_tokens], positions[:total_tokens])
-                
-                with torch.cuda.graph(graph, self.jacobi_graph_pool):
+
+        try:
+            for bs in reversed(graph_bs):
+                for L in graph_block_lens:
+                    total_tokens = bs * L
+
+                    graph = torch.cuda.CUDAGraph()
+
+                    set_context(
+                        is_prefill=True,
+                        slot_mapping=slot_mapping[:total_tokens],
+                        block_tables=block_tables[:bs],
+                        cache_seqlens=cache_seqlens[:bs],
+                        seqlen_q=L,
+                        is_jacobi_graphed=True
+                    )
+
                     outputs[:total_tokens] = self.model(input_ids[:total_tokens], positions[:total_tokens])
-                
-                if self.jacobi_graph_pool is None:
-                    self.jacobi_graph_pool = graph.pool()
-                
-                self.jacobi_graphs[(bs, L)] = graph
-                torch.cuda.synchronize()
-                reset_context()
-        
-        self.jacobi_graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            cache_seqlens=cache_seqlens,
-            block_tables=block_tables,
-            outputs=outputs,
-        )
-        
-        print(f"[CUDAGRAPH_JACOBI] Captured {len(self.jacobi_graphs)} Jacobi graphs")
+
+                    with torch.cuda.graph(graph, self.jacobi_graph_pool):
+                        outputs[:total_tokens] = self.model(input_ids[:total_tokens], positions[:total_tokens])
+
+                    if self.jacobi_graph_pool is None:
+                        self.jacobi_graph_pool = graph.pool()
+
+                    self.jacobi_graphs[(bs, L)] = graph
+                    torch.cuda.synchronize()
+                    reset_context()
+
+            self.jacobi_graph_vars = dict(
+                input_ids=input_ids,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                cache_seqlens=cache_seqlens,
+                block_tables=block_tables,
+                outputs=outputs,
+            )
+
+            print(f"[CUDAGRAPH_JACOBI] Captured {len(self.jacobi_graphs)} Jacobi graphs")
+        except torch.OutOfMemoryError as exc:
+            reset_context()
+            self.jacobi_graphs = {}
+            self.jacobi_graph_pool = None
+            if hasattr(self, "jacobi_graph_vars"):
+                del self.jacobi_graph_vars
+            torch.cuda.empty_cache()
+            print(
+                "[CUDAGRAPH_JACOBI] OOM during Jacobi CUDA graph capture. "
+                "Falling back to eager Jacobi decoding for uncaptured shapes. "
+                "Use --nano-vllm-enforce-eager to skip graph capture entirely."
+            )
+            print(f"[CUDAGRAPH_JACOBI] OOM details: {exc}")
+        except Exception as exc:
+            reset_context()
+            self.jacobi_graphs = {}
+            self.jacobi_graph_pool = None
+            if hasattr(self, "jacobi_graph_vars"):
+                del self.jacobi_graph_vars
+            torch.cuda.empty_cache()
+            print(
+                "[CUDAGRAPH_JACOBI] Graph capture failed for this model/shape. "
+                "Falling back to eager Jacobi decoding for uncaptured shapes."
+            )
+            print(f"[CUDAGRAPH_JACOBI] Capture error: {exc}")
