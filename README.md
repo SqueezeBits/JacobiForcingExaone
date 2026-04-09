@@ -4,6 +4,9 @@
 
 <div align="center"><h1>&nbsp;Jacobi Forcing: Fast and Accurate Causal Parallel Decoding</h1></div>
 
+> This repository is a fork maintained for K-LLM integration and experimentation.
+> K-LLM-specific changes are tracked in [README_KLLM.md](README_KLLM.md).
+
 <!-- =========================
      Badges + Links
      ========================= -->

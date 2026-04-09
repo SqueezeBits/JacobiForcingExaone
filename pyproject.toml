@@ -1,0 +1,43 @@
+[project]
+name = "jacobiforcing-exaone"
+version = "0.1.0"
+description = "uv-managed environment for Jacobi Forcing experiments"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "accelerate>=1.8.1,<2",
+    "datasets>=3.6.0,<4",
+    "deepspeed>=0.18.9,<0.19",
+    "einops>=0.8.1,<0.9",
+    "flash-attn==2.8.3",
+    "ijson>=3.4.0,<4",
+    "matplotlib>=3.10.7,<4",
+    "ninja>=1.11.1,<2",
+    "numpy>=2.3.3,<3",
+    "pandas>=2.3.0,<3",
+    "peft>=0.15.2,<0.16",
+    "pyarrow>=20.0.0,<21",
+    "safetensors>=0.5.3,<0.6",
+    "scipy>=1.16.3,<2",
+    "streamlit>=1.52.1,<2",
+    "torch==2.11.0",
+    "transformers==5.5.0",
+    "tqdm>=4.67.1,<5",
+    "wandb>=0.21.0,<0.22",
+    "xxhash>=3.5.0,<4",
+]
+
+[tool.uv.sources]
+# Keep PyTorch on the CUDA 13 wheel channel so the locked environment matches
+# the future B200 target nodes.
+torch = [{ index = "pytorch-cu130" }]
+
+[tool.uv]
+# `flash-attn` imports `torch` from `setup.py`, so the default PEP 517 isolated
+# build environment fails unless we let uv build it against the project env.
+# We keep `deepspeed` on the same path to avoid mismatched Torch ABI issues.
+no-build-isolation-package = ["deepspeed", "flash-attn"]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
