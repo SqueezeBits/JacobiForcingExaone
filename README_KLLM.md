@@ -10,22 +10,14 @@ K-LLM-specific environment guidance is maintained here instead of the upstream
 `README.md`.
 
 1. Install `uv` and sync the default environment.
-   This path is enough for the Hugging Face and Jacobi Forcing flows and does
-   not install `vllm`.
+   This path is enough for the Hugging Face and Jacobi Forcing flows.
 
 ```bash
 uv sync
 ```
 
-2. When you need `vllm`, install it as an extra instead of mixing it into the
-   default environment by accident.
-
-```bash
-uv sync --extra vllm
-```
-
-3. If you want to keep separate virtual environments in the same repo, use two
-   venv directories and sync the active one:
+2. If you want to keep a repo-local virtual environment, create it explicitly
+   and sync the active interpreter:
 
 ```bash
 uv venv .venv
@@ -33,22 +25,16 @@ source .venv/bin/activate
 uv sync --active
 ```
 
-```bash
-uv venv .venv-vllm
-source .venv-vllm/bin/activate
-uv sync --active --extra vllm
-```
-
-4. Run commands inside the managed environment:
+3. Run commands inside the managed environment:
 
 ```bash
 uv run streamlit run applications/jacobi_model_chat.py
 ```
 
-5. The current K-LLM environment target is:
+4. The current K-LLM environment target is:
 
 - Python 3.12
-- `transformers==5.5.0`
+- `transformers>=4.56.0,<5`
 - `torch==2.11.0+cu130`
 - CUDA 13 wheel index via PyTorch
 
@@ -69,6 +55,11 @@ uv run streamlit run applications/jacobi_model_chat.py
 - Record K-LLM-specific changes in this file.
 - Keep upstream project documentation in `README.md`.
 - Use dated entries when behavior, dependencies, scripts, or model support change.
+
+## Data Preparation
+
+Solar-Open-100B trajectory generation and packed data preparation are documented
+in [docs/data_generation.md](docs/data_generation.md).
 
 
 ## Benchmark

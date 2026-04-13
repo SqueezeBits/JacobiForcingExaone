@@ -1,123 +1,269 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Bucket **OpenCodeInstruct**-style data into fixed-count shards (default: 5k examples),
-using a chat template to tokenize the full (user,input ↔ assistant,output) pair and
-sorting by total token count.
+Bucket OpenCodeInstruct JSONL records by Solar-compatible chat-template length.
 
-Strict assumptions (per dataset card):
-- Each JSONL row has fields: `input` (question/instruction) and `output` (LLM response).
-- We emit ONLY `user` and `assistant` roles; no system role.
-- Input format: ONLY `*.jsonl` under --input_path (one JSON object per line).
-- Output: JSON files named `bucket_XXXX_avgA_minB_maxC.json`, each a JSON array of the
-  FIRST user prompts (i.e., the `input` text) for the 5k examples in that bucket.
-
-Usage:
-    python bucket_opencodeinstruct.py \
-        --input_path /path/to/jsonl_dir \
-        --output_path /path/to/out \
-        --tokenizer_path Qwen/Qwen2.5-7B-Instruct \
-        --bucket_size 5000 \
-        --n_workers 8
+Each bucket file is a JSON array of records with enough metadata to support
+deterministic downstream split selection and trajectory generation.
 """
 
-import os, glob, json, argparse, multiprocessing as mp
+import argparse
+import glob
+import json
+import multiprocessing as mp
+import os
+import random
 from functools import partial
-from typing import List, Dict, Any, Optional
+from itertools import chain
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+
+from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-TOKENIZER_PATH: Optional[str] = "/checkpoint/lhu/models/Qwen2.5-Coder-7B-Instruct"  # set from CLI in main()
-TOKENIZER = None                      # global per worker
+TOKENIZER_PATH: Optional[str] = None
+TOKENIZER = None
+CHAT_TEMPLATE_MODE = "solar"
 
 
-def init_worker():
-    """Initialise the global tokenizer once per worker."""
-    global TOKENIZER
+def init_worker(tokenizer_path: str):
+    global TOKENIZER_PATH, TOKENIZER
+    TOKENIZER_PATH = tokenizer_path
     if TOKENIZER is None:
         if not TOKENIZER_PATH:
             raise RuntimeError("TOKENIZER_PATH not set in worker.")
         TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_PATH, trust_remote_code=True)
 
 
-def tokenize_pair(user_text: str, assistant_text: str) -> Optional[int]:
-    """Return total token count for a (user, assistant) pair via apply_chat_template."""
-    global TOKENIZER
-    msgs = [
+def build_messages(user_text: str, assistant_text: str, chat_template_mode: str) -> List[Dict[str, str]]:
+    if chat_template_mode != "solar":
+        raise ValueError(f"Unsupported --chat_template_mode: {chat_template_mode}")
+    return [
         {"role": "user", "content": user_text},
         {"role": "assistant", "content": assistant_text},
     ]
+
+
+def tokenize_pair(user_text: str, assistant_text: str) -> Optional[int]:
+    global TOKENIZER
+    messages = build_messages(user_text, assistant_text, CHAT_TEMPLATE_MODE)
     try:
-        ids = (
-            TOKENIZER.apply_chat_template(
-                msgs,
-                tokenize=True,
-                add_generation_prompt=False,
-                return_tensors="pt",
-            )
-            .squeeze(0)
-            .tolist()
+        ids = TOKENIZER.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_tensors="pt",
         )
-        return len(ids)
-    except Exception as e:
-        print("⚠️  Tokenization error:", e)
+        return int(ids.shape[-1])
+    except Exception as exc:
+        print(f"Tokenization error: {exc}")
         return None
 
 
-def process_sample(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Build messages from `input`/`output`, tokenise, and return stats for bucketing."""
-    inp = sample.get("input")
-    out = sample.get("output")
-    if not isinstance(inp, str) or not isinstance(out, str):
+def process_sample(sample_with_meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    sample = sample_with_meta["sample"]
+    source_file = sample_with_meta["source_file"]
+    source_index = sample_with_meta["source_index"]
+
+    prompt = sample.get("input")
+    response = sample.get("output")
+    if not isinstance(prompt, str) or not isinstance(response, str):
         return None
-    n_tok = tokenize_pair(inp, out)
 
-    # tidy whitespace of prompt for output file
-    prompt_clean = " ".join(inp.split())
-    return {"prompt": prompt_clean, "n_tokens": n_tok}
+    prompt_clean = " ".join(prompt.split())
+    response_clean = response.strip()
+    if not prompt_clean or not response_clean:
+        return None
+
+    n_tokens = tokenize_pair(prompt_clean, response_clean)
+    if n_tokens is None:
+        return None
+
+    return {
+        "prompt": prompt_clean,
+        "response": response_clean,
+        "n_tokens": n_tokens,
+        "source_file": source_file,
+        "source_index": int(source_index),
+        "source_record_id": f"{os.path.basename(source_file)}:{int(source_index)}",
+    }
 
 
-def load_all_records(input_path: str) -> List[Dict[str, Any]]:
-    """Load only *.jsonl files under a directory into a list of dicts."""
-    paths = sorted(glob.glob(os.path.join(input_path, "*.jsonl")))
-    if not paths:
-        raise FileNotFoundError(f"No *.jsonl found under {input_path}")
-    print(f"STEP 0:  Found {len(paths)} jsonl file(s). Reading...")
+def discover_input_source(input_path: str) -> Tuple[str, List[str], List[str]]:
+    path = Path(input_path)
+    if path.is_file():
+        suffix = path.suffix.lower()
+        if suffix == ".jsonl":
+            return "local_files", [str(path)], []
+        if suffix == ".parquet":
+            return "local_files", [], [str(path)]
+        raise FileNotFoundError(f"Unsupported file type for {input_path}; expected .jsonl or .parquet")
+    if not path.is_dir():
+        return "dataset_repo", [], []
 
+    jsonl_paths = sorted(glob.glob(os.path.join(input_path, "**", "*.jsonl"), recursive=True))
+    parquet_paths = sorted(glob.glob(os.path.join(input_path, "**", "*.parquet"), recursive=True))
+    return "local_files", jsonl_paths, parquet_paths
+
+
+def load_records_from_jsonl(path: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for p in paths:
-        with open(p, "r", encoding="utf-8") as fin:
-            for i, line in enumerate(fin, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception as e:
-                    print(f"⚠️  Skipping bad JSON line {i} in {os.path.basename(p)}: {e}")
-                    continue
-                rows.append(obj)
-    print(f"STEP 1:  Loaded {len(rows):,} json-rows from {len(paths)} file(s)")
+    with open(path, "r", encoding="utf-8") as fin:
+        for line_idx, line in enumerate(fin):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                sample = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"Skipping bad JSON line {line_idx + 1} in {os.path.basename(path)}: {exc}")
+                continue
+            rows.append(
+                {
+                    "sample": sample,
+                    "source_file": path,
+                    "source_index": line_idx,
+                }
+            )
     return rows
 
 
-def main(input_path: str,
-         output_path: str,
-         *,
-         tokenizer_path: str,
-         bucket_size: int = 5_000,
-         n_workers: int = 8):
+def load_records_from_parquet(path: str) -> List[Dict[str, Any]]:
+    dataset = load_dataset("parquet", data_files=path, split="train")
+    rows: List[Dict[str, Any]] = []
+    for row_idx, sample in enumerate(dataset):
+        rows.append(
+            {
+                "sample": dict(sample),
+                "source_file": path,
+                "source_index": row_idx,
+            }
+        )
+    return rows
 
-    global TOKENIZER_PATH
+
+def iter_records_from_jsonl(path: str) -> Iterator[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as fin:
+        for line_idx, line in enumerate(fin):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                sample = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"Skipping bad JSON line {line_idx + 1} in {os.path.basename(path)}: {exc}")
+                continue
+            yield {
+                "sample": sample,
+                "source_file": path,
+                "source_index": line_idx,
+            }
+
+
+def iter_records_from_parquet(paths: List[str], source_name: str) -> Iterator[Dict[str, Any]]:
+    dataset = load_dataset("parquet", data_files=paths, split="train", streaming=True)
+    for row_idx, sample in enumerate(dataset):
+        yield {
+            "sample": dict(sample),
+            "source_file": source_name,
+            "source_index": row_idx,
+        }
+
+
+def iter_records_from_dataset_repo(dataset_name: str, split_name: str) -> Iterator[Dict[str, Any]]:
+    dataset = load_dataset(dataset_name, split=split_name, streaming=True)
+    for row_idx, sample in enumerate(dataset):
+        yield {
+            "sample": dict(sample),
+            "source_file": dataset_name,
+            "source_index": row_idx,
+        }
+
+
+def maybe_reservoir_sample(
+    records_iter: Iterable[Dict[str, Any]],
+    *,
+    max_samples: Optional[int],
+    sample_seed: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    if max_samples is None or max_samples <= 0:
+        records = list(records_iter)
+        return records, len(records)
+
+    rng = random.Random(sample_seed)
+    reservoir: List[Dict[str, Any]] = []
+    total_seen = 0
+    for total_seen, record in enumerate(records_iter, start=1):
+        if len(reservoir) < max_samples:
+            reservoir.append(record)
+            continue
+        swap_idx = rng.randint(0, total_seen - 1)
+        if swap_idx < max_samples:
+            reservoir[swap_idx] = record
+    return reservoir, total_seen
+
+
+def load_all_records(
+    input_path: str,
+    input_split: str,
+    *,
+    max_samples: Optional[int],
+    sample_seed: int,
+) -> List[Dict[str, Any]]:
+    source_kind, jsonl_paths, parquet_paths = discover_input_source(input_path)
+    if source_kind == "dataset_repo":
+        print(f"STEP 0: Streaming dataset repo {input_path} split={input_split}")
+        rows, total_seen = maybe_reservoir_sample(
+            iter_records_from_dataset_repo(input_path, input_split),
+            max_samples=max_samples,
+            sample_seed=sample_seed,
+        )
+        print(f"STEP 1: Selected {len(rows):,} rows from {total_seen:,} streamed dataset rows")
+        return rows
+    if not jsonl_paths and not parquet_paths:
+        raise FileNotFoundError(f"No .jsonl or .parquet files found under {input_path}")
+
+    print(
+        f"STEP 0: Streaming {len(jsonl_paths)} jsonl file(s) and {len(parquet_paths)} parquet file(s)."
+    )
+    iterators: List[Iterable[Dict[str, Any]]] = [iter_records_from_jsonl(path) for path in jsonl_paths]
+    if parquet_paths:
+        iterators.append(iter_records_from_parquet(parquet_paths, input_path))
+    rows, total_seen = maybe_reservoir_sample(
+        chain.from_iterable(iterators),
+        max_samples=max_samples,
+        sample_seed=sample_seed,
+    )
+    print(f"STEP 1: Selected {len(rows):,} rows from {total_seen:,} streamed local rows")
+    return rows
+
+
+def main(
+    input_path: str,
+    output_path: str,
+    *,
+    tokenizer_path: str,
+    chat_template_mode: str,
+    input_split: str,
+    max_samples: Optional[int],
+    sample_seed: int,
+    bucket_size: int,
+    n_workers: int,
+):
+    global TOKENIZER_PATH, CHAT_TEMPLATE_MODE
     TOKENIZER_PATH = tokenizer_path
+    CHAT_TEMPLATE_MODE = chat_template_mode
 
     os.makedirs(output_path, exist_ok=True)
+    samples = load_all_records(
+        input_path,
+        input_split,
+        max_samples=max_samples,
+        sample_seed=sample_seed,
+    )
 
-    # 1) Load ------------------------------------------------------------------------------------
-    samples = load_all_records(input_path)
-
-    # 2) Token-count each sample in parallel -----------------------------------------------------
-    with mp.Pool(n_workers, initializer=init_worker) as pool:
+    with mp.Pool(n_workers, initializer=init_worker, initargs=(tokenizer_path,)) as pool:
         processed = list(
             tqdm(
                 pool.imap(partial(process_sample), samples),
@@ -126,63 +272,89 @@ def main(input_path: str,
             )
         )
 
-    processed = [p for p in processed if p is not None]
-    print(f"STEP 2:  Tokenised {len(processed):,} samples")
+    processed = [record for record in processed if record is not None]
+    processed.sort(key=lambda record: (record["n_tokens"], record["source_file"], record["source_index"]))
 
-    # 3) Sort by token length (ascending)
-    processed.sort(key=lambda x: x["n_tokens"])
+    print(f"STEP 2: Tokenised {len(processed):,} samples")
+    print(f"STEP 3: Bucketing {len(processed):,} records with bucket_size={bucket_size}")
 
-    # 4) Slice into buckets of N prompts
-    print(f"STEP 3:  Bucketing {len(processed):,} prompts --> {bucket_size} prompts per file")
-    for i in range(0, len(processed), bucket_size):
-        bucket_idx = i // bucket_size
-        bucket     = processed[i : i + bucket_size]
+    for start in range(0, len(processed), bucket_size):
+        bucket_idx = start // bucket_size
+        bucket = processed[start : start + bucket_size]
         if not bucket:
             continue
 
-        tok_counts = [b["n_tokens"] for b in bucket]
-        min_tok    = min(tok_counts)
-        max_tok    = max(tok_counts)
-        avg_tok    = int(round(sum(tok_counts) / len(tok_counts)))
+        token_counts = [record["n_tokens"] for record in bucket]
+        bucket_meta = {
+            "bucket_index": bucket_idx,
+            "avg_tokens": int(round(sum(token_counts) / len(token_counts))),
+            "min_tokens": min(token_counts),
+            "max_tokens": max(token_counts),
+            "count": len(bucket),
+            "chat_template_mode": chat_template_mode,
+            "tokenizer_path": tokenizer_path,
+        }
 
-        out_fname = (
+        output_name = (
             f"bucket_{bucket_idx:04d}"
-            f"_avg{avg_tok}_min{min_tok}_max{max_tok}.json"
+            f"_avg{bucket_meta['avg_tokens']}"
+            f"_min{bucket_meta['min_tokens']}"
+            f"_max{bucket_meta['max_tokens']}.json"
         )
-        out_path  = os.path.join(output_path, out_fname)
+        output_file = os.path.join(output_path, output_name)
+        with open(output_file, "w", encoding="utf-8") as fout:
+            json.dump(bucket, fout, ensure_ascii=False, indent=2)
 
-        prompts = [item["prompt"] for item in bucket]
-        with open(out_path, "w", encoding="utf-8") as fout:
-            json.dump(prompts, fout, ensure_ascii=False, indent=2)
-
-        print(f"-- {out_fname}  ({len(prompts)} prompts, {sum(tok_counts):,} tokens)")
+        print(
+            f"-- {output_name}"
+            f" ({bucket_meta['count']} records, avg={bucket_meta['avg_tokens']},"
+            f" min={bucket_meta['min_tokens']}, max={bucket_meta['max_tokens']})"
+        )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description=(
-            "Bucket OpenCodeInstruct prompts (input→user) by total token length. "
-            "Each output file contains a fixed NUMBER of prompts."
-        )
+        description="Bucket OpenCodeInstruct records by Solar chat-template token length."
     )
-    parser.add_argument("--input_path",  required=True,
-                        help="Directory containing *.jsonl files")
-    parser.add_argument("--output_path", required=True,
-                        help="Directory for bucketed prompt files")
-    parser.add_argument("--tokenizer_path", required=True,
-                        help="HF repo or local path for tokenizer with a chat template")
-    parser.add_argument("--bucket_size", type=int, default=25_000,
-                        help="Number of prompts per output file (default: 25 000)")
-    parser.add_argument("--n_workers",   type=int, default=8,
-                        help="Tokenisation workers (default: 8)")
-
+    parser.add_argument(
+        "--input_path",
+        required=True,
+        help="Local .jsonl/.parquet path, local directory, or dataset repo id such as nvidia/OpenCodeInstruct",
+    )
+    parser.add_argument("--input_split", default="train", help="Dataset split when --input_path is a dataset repo id")
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Reservoir-sample at most this many records before tokenization/bucketing",
+    )
+    parser.add_argument(
+        "--sample_seed",
+        type=int,
+        default=42,
+        help="Random seed for reservoir sampling when --max_samples is set",
+    )
+    parser.add_argument("--output_path", required=True, help="Directory for bucket files")
+    parser.add_argument("--tokenizer_path", required=True, help="HF repo or local tokenizer path")
+    parser.add_argument(
+        "--chat_template_mode",
+        default="solar",
+        choices=["solar"],
+        help="Chat template mode used for token counting",
+    )
+    parser.add_argument("--bucket_size", type=int, default=25_000, help="Number of records per bucket")
+    parser.add_argument("--n_workers", type=int, default=8, help="Tokenisation workers")
     args = parser.parse_args()
-    mp.set_start_method("spawn", force=True)
 
+    mp.set_start_method("spawn", force=True)
     main(
         args.input_path,
         args.output_path,
         tokenizer_path=args.tokenizer_path,
+        chat_template_mode=args.chat_template_mode,
+        input_split=args.input_split,
+        max_samples=args.max_samples,
+        sample_seed=args.sample_seed,
         bucket_size=args.bucket_size,
         n_workers=args.n_workers,
     )

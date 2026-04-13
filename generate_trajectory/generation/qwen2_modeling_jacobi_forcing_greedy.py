@@ -116,9 +116,11 @@ def jacobi_forward_greedy(
         hidden_states = self.model.norm(hidden_states)
         logits = self.lm_head(hidden_states).float()
 
-        scores = logits_processors(input_ids, logits.squeeze(0)).unsqueeze(0) 
-        probs = torch.nn.functional.softmax(scores, dim=-1)
-        first_correct_token = torch.argmax(probs[:, -1, :], dim=-1, keepdim=True)
+        scores = logits_processors(input_ids, logits.squeeze(0)).unsqueeze(0)
+        # Compute all greedy choices once and reuse them instead of repeatedly taking argmax
+        # from different score slices.
+        greedy_all_tokens = torch.argmax(scores, dim=-1)
+        first_correct_token = greedy_all_tokens[:, -1:].clone()
         
         # TODO: pass the draft here to the next iteration for inspection
         return past_key_values, first_correct_token, None, 1
@@ -422,12 +424,12 @@ def get_jacobi_forward_trajectory_greedy(
             hidden_states = self.model.norm(hidden_states)
             logits = self.lm_head(hidden_states).float()
     
-            # Apply logits processor, then softmax
-            p_scores = logits_processors(out, logits.squeeze(0)).unsqueeze(0) 
-            p_prob = torch.nn.functional.softmax(p_scores, dim=-1)
+            # Greedy decoding only needs the ordering of processed logits.
+            p_scores = logits_processors(out, logits.squeeze(0)).unsqueeze(0)
+            greedy_all_tokens = torch.argmax(p_scores, dim=-1)
     
             # Greedy tokens for each draft position (exclude the last slot which is prob_next)
-            greedy_tokens = torch.argmax(p_prob[:, :-1, :], dim=-1)      # [1, n_token_seq_len-1]
+            greedy_tokens = greedy_all_tokens[:, :-1]      # [1, n_token_seq_len-1]
             # Compare draft vs greedy: accept the longest exact-match prefix
             mismatch = (out[:, 1:] != greedy_tokens)
             accepted = (mismatch.cumsum(dim=-1) == 0).sum(dim=-1)+1
@@ -443,19 +445,19 @@ def get_jacobi_forward_trajectory_greedy(
                 # Delete false keys&values
                 past_key_values.delete_false_key_value(out.shape[1]-num_accepted)
                 # Append the greedy token at the first mismatch
-                next_token = torch.argmax(p_prob[:, num_accepted-1, :], dim=-1, keepdim=True)
+                next_token = greedy_tokens[:, num_accepted-1].unsqueeze(-1)
                 out = next_token
 
-                # Rebuild draft tail greedily from the remaining positions in this pass (after the mismatch slot)
-                q_probs_rem = p_prob[:, num_accepted:-1, :]
-                if q_probs_rem.shape[1] > 0:
-                    q_sampled = torch.argmax(q_probs_rem, dim=-1)  # [1, L']
+                # Reuse the already-computed greedy tokens for the remaining draft positions.
+                q_tokens_rem = greedy_tokens[:, num_accepted:]
+                if q_tokens_rem.shape[1] > 0:
+                    q_sampled = q_tokens_rem  # [1, L']
                     out = torch.cat((out, q_sampled), dim=-1)
                     answer_trajectory_ids.append(torch.cat((accepted_n_gram[:, :total_accepted], out), dim=-1))
                 continue
     
             # If we didn't reject anything, append the next greedy token and finish this block
-            next_token = torch.argmax(p_prob[:, -1, :], dim=-1, keepdim=True)
+            next_token = greedy_all_tokens[:, -1:].clone()
             total_accepted += 1
             answer_trajectory_ids.append(accepted_n_gram)
 
