@@ -224,17 +224,54 @@ bash generate_trajectory/generation/run_solar_opencodeinstruct_2step.sh
 `STEP=all`은 step1을 먼저 끝낸 뒤 step2를 이어서 실행한다. 두 step을 동시에 돌리지는 않는다.
 
 ```bash
-MODEL_PATH="$SOLAR_MODEL" \
-TOKENIZER_PATH="$SOLAR_TOKENIZER" \
-SPLIT_DIR="$SPLIT_DIR" \
-OUTPUT_ROOT="$PIPELINE_OUT" \
+MODEL_PATH="upstage/Solar-Open-100B" \
+TOKENIZER_PATH="upstage/Solar-Open-100B" \
+SPLIT_DIR="runs/solar_open_100b_opencode_2step/opencodeinstruct_solar_splits" \
+OUTPUT_ROOT="runs/solar_open_100b_opencode_2step/pipeline" \
 STEP="all" \
-SEED="$SEED" \
+SEED="42" \
 GPUS="4 5 6 7" \
 CHAT_TEMPLATE_MODE="solar" \
 MAX_NEW_SEQ_LEN=2048 \
 bash generate_trajectory/generation/run_solar_opencodeinstruct_2step.sh
 ```
+
+#### 4-vLLM. vLLM 경로를 쓸 때
+
+`run_solar_opencodeinstruct_2step.sh`는 현재 HF/torch 기반 경로 기준 설명이다.
+vLLM 경로로 step1/step2를 돌릴 때는 `split_a`, `split_b`를 각각 vLLM launcher로
+실행해야 한다.
+
+중요:
+
+- vLLM은 독립된 venv에서 실행하는 것을 권장
+- 먼저 `/NHNHOME/WORKSPACE/0426030021_A/eunikpark/projects/kllm_workspace/.venv-vllm`를 activate
+- 그 다음 `generate_trajectory/generation/generate_trajectory_opencodeinstruct_vllm_greedy.sh`를 사용
+
+예시는 다음과 같다.
+
+step1 (`split_a`):
+
+```bash
+cd /NHNHOME/WORKSPACE/0426030021_A/eunikpark/projects/kllm_workspace
+source .venv-vllm/bin/activate
+cd JacobiForcing-K-LLM
+
+MODEL_PATH="nota-ai/Solar-Open-100B-Nota-FP8" \
+TOKENIZER_PATH="nota-ai/Solar-Open-100B-Nota-FP8" \
+STEP="split_a" \
+MAX_RECORDS=-1 \
+GPUS="4 5 6 7" \
+MAX_NEW_SEQ_LEN=2048 \
+MAX_NUM_BATCHED_TOKENS=16384 \
+MAX_ACTIVE_PROMPTS=10 \
+bash generate_trajectory/generation/generate_trajectory_opencodeinstruct_vllm_greedy.sh
+```
+
+step2 (`split_b`)도 같은 형식으로 `SPLIT_FILE`과 `SAVE_PATH`만 바꿔서 실행한다.
+
+자세한 설명은
+[docs/vllm_trajectory_generation.md](vllm_trajectory_generation.md)에 정리했다.
 
 #### 4-1. step1 전체 실행
 
@@ -309,3 +346,86 @@ shell script 자체도 현재는 `echo`를 추가해 두었기 때문에,
 
 생성된 trajectory를 detokenize해서 사람이 읽기 쉽게 확인하는 도구는
 [tools/inspect_trajectory_decode.md](../tools/inspect_trajectory_decode.md)에 정리돼 있다.
+
+## vLLM FP8 trajectory 생성 경로
+
+느린 HF/torch teacher forward 대신 `nota-ai/Solar-Open-100B-Nota-FP8`를
+vLLM offline inference로 띄워 trajectory를 생성하는 경로를 유지한다.
+
+현재 기준:
+
+- 물리 GPU `4,5,6,7`만 사용
+- `TP4 + expert parallel enabled`
+- 기본 scoring mode는 `apc_multi_prefix`만 사용
+- vLLM은 반드시 독립된 venv에서 실행하는 것을 권장
+
+권장 환경:
+
+```bash
+cd /NHNHOME/WORKSPACE/0426030021_A/eunikpark/projects/kllm_workspace
+source .venv-vllm/bin/activate
+cd JacobiForcing-K-LLM
+```
+
+현재 vLLM 경로의 자세한 설명은
+[docs/vllm_trajectory_generation.md](vllm_trajectory_generation.md)에 정리했다.
+
+### 1. vLLM으로 10개 trajectory 생성
+
+```bash
+cd /NHNHOME/WORKSPACE/0426030021_A/eunikpark/projects/kllm_workspace
+source .venv-vllm/bin/activate
+cd JacobiForcing-K-LLM
+
+MODEL_PATH="nota-ai/Solar-Open-100B-Nota-FP8" \
+TOKENIZER_PATH="nota-ai/Solar-Open-100B-Nota-FP8" \
+STEP="split_a" \
+MAX_RECORDS=10 \
+GPUS="4 5 6 7" \
+MAX_NEW_SEQ_LEN=2048 \
+MAX_NUM_BATCHED_TOKENS=16384 \
+MAX_ACTIVE_PROMPTS=4 \
+bash generate_trajectory/generation/generate_trajectory_opencodeinstruct_vllm_greedy.sh
+```
+
+### 2. vLLM으로 split_a 전체 생성
+
+```bash
+cd /NHNHOME/WORKSPACE/0426030021_A/eunikpark/projects/kllm_workspace
+source .venv-vllm/bin/activate
+cd JacobiForcing-K-LLM
+
+MODEL_PATH="nota-ai/Solar-Open-100B-Nota-FP8" \
+TOKENIZER_PATH="nota-ai/Solar-Open-100B-Nota-FP8" \
+STEP="split_a" \
+MAX_RECORDS=-1 \
+GPUS="4 5 6 7" \
+MAX_NEW_SEQ_LEN=2048 \
+MAX_NUM_BATCHED_TOKENS=16384 \
+MAX_ACTIVE_PROMPTS=10 \
+bash generate_trajectory/generation/generate_trajectory_opencodeinstruct_vllm_greedy.sh
+```
+
+### 3. vLLM으로 split_b 전체 생성
+
+```bash
+cd /NHNHOME/WORKSPACE/0426030021_A/eunikpark/projects/kllm_workspace
+source .venv-vllm/bin/activate
+cd JacobiForcing-K-LLM
+
+MODEL_PATH="nota-ai/Solar-Open-100B-Nota-FP8" \
+TOKENIZER_PATH="nota-ai/Solar-Open-100B-Nota-FP8" \
+STEP="split_b" \
+MAX_RECORDS=-1 \
+GPUS="4 5 6 7" \
+MAX_NEW_SEQ_LEN=2048 \
+MAX_NUM_BATCHED_TOKENS=16384 \
+MAX_ACTIVE_PROMPTS=10 \
+bash generate_trajectory/generation/generate_trajectory_opencodeinstruct_vllm_greedy.sh
+```
+
+현재 validated benchmark 기준:
+
+- `STEP=split_a`
+- `1280` records
+- `0` skips

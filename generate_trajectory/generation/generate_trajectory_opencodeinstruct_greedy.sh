@@ -43,9 +43,9 @@ echo "Launching TP${TP_SIZE} trajectory generation for ${SPLIT_FILE}"
 echo "Using physical GPUs: ${GPU_CSV}"
 
 CUDA_VISIBLE_DEVICES="${GPU_CSV}" \
-uv run torchrun \
+"$(pwd)/.venv/bin/torchrun" \
     --standalone \
-    --nproc-per-node "${TP_SIZE}" \
+    --nproc-per-node 1 \
     --master-port "${MASTER_PORT}" \
     generate_trajectory/generation/generate_trajectory_opencodeinstruct_greedy.py \
     --filename "${SPLIT_FILE}" \

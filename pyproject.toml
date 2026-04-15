@@ -26,6 +26,7 @@ dependencies = [
     "xxhash>=3.5.0,<4",
     "nvitop>=1.6.2",
     "kernels>=0.13.0",
+    "compressed-tensors>=0.15.0.1",
 ]
 
 [tool.uv.sources]

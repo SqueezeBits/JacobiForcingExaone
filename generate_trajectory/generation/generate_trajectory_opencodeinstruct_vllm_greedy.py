@@ -2,22 +2,12 @@
 # -*- coding: utf-8 -*-
 """Generate JacobiForcing greedy trajectories with vLLM offline inference.
 
-This script avoids HF model-cache surgery by scoring each Jacobi draft block via
-vLLM.  The fast path asks vLLM for prompt_logprobs on ``context + draft_block``
-while keeping automatic prefix caching (APC) enabled.  vLLM normally disables
-prefix-cache reads for prompt_logprobs because cached prompt positions may not
-produce logprobs; therefore this script validates every required draft-block
-position and falls back when a cached/boundary position is missing.
-
-Fallback choices:
-  * non_apc_prompt_logprobs: one full ``context + draft`` scoring request with
-    prefix-cache reads disabled per request.
-  * apc_multi_prefix: ``n`` one-token greedy generation requests for
-    ``context + draft[:1]``, ..., ``context + draft[:n]`` with APC enabled.
-
-The auto fallback mode benchmarks both choices on the first fallback blocks and
-uses the faster valid method afterwards.
+The production path keeps APC enabled and uses ``apc_multi_prefix``:
+``n`` one-token greedy generation requests for ``context + draft[:1]``, ...,
+``context + draft[:n]`` with APC enabled.
 """
+
+
 
 from __future__ import annotations
 
@@ -25,7 +15,6 @@ import argparse
 import json
 import os
 import random
-import sys
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -35,6 +24,10 @@ from typing import Any, Sequence
 from huggingface_hub import snapshot_download
 from tqdm import tqdm
 from transformers import AutoTokenizer
+
+
+from vllm import LLM, SamplingParams  # type: ignore
+from vllm.inputs import TokensPrompt  # type: ignore
 
 # Suppress a noisy third-party deprecation warning emitted by nvidia_cutlass_dsl
 # during Solar FP8 model load.
@@ -49,8 +42,9 @@ warnings.filterwarnings(
 class BlockScore:
     """Greedy predictions for a candidate Jacobi block."""
 
-    # greedy_all[:len(block)] are the greedy tokens for each block position.
-    # greedy_all[-1] is the next token after the full block.
+    # greedy_all[i] is the greedy token after context + block[: i + 1].
+    # Thus greedy_all[:-1] is compared with block[1:], and greedy_all[-1]
+    # is the next token after the full block.
     greedy_all: list[int]
     method: str
     num_cached_tokens: int = 0
@@ -58,32 +52,29 @@ class BlockScore:
 
 
 @dataclass
-class FallbackStats:
-    method_times: dict[str, float] = field(
-        default_factory=lambda: {"non_apc_prompt_logprobs": 0.0, "apc_multi_prefix": 0.0}
-    )
-    method_counts: dict[str, int] = field(
-        default_factory=lambda: {"non_apc_prompt_logprobs": 0, "apc_multi_prefix": 0}
-    )
-    chosen_method: str | None = None
-    calibration_attempts: int = 0
-    mismatches: int = 0
+class PromptGenerationState:
+    record_idx: int
+    data_id: str
+    input_ids: list[int]
+    generated_ids: list[int]
+    rng: random.Random
+    iterations: int = 0
+    per_iteration_records: list[dict[str, Any]] = field(default_factory=list)
+    skip_records: list[dict[str, Any]] = field(default_factory=list)
 
 
-def maybe_prepend_vllm_repo(vllm_repo: str | None) -> None:
-    if not vllm_repo:
-        return
-    repo_path = Path(vllm_repo).expanduser().resolve()
-    if repo_path.exists():
-        sys.path.insert(0, str(repo_path))
+@dataclass
+class JacobiBlockState:
+    prompt_state: PromptGenerationState
+    prompt_ids_for_record: list[int]
+    block: list[int]
+    accepted_n_gram: list[int]
+    answer_trajectory_ids: list[list[int]]
+    diagnostics: list[dict[str, Any]]
+    score_context: list[int]
+    total_accepted: int = 0
+    next_token: int = 0
 
-
-def import_vllm(vllm_repo: str | None):
-    maybe_prepend_vllm_repo(vllm_repo)
-    from vllm import LLM, SamplingParams  # type: ignore
-    from vllm.inputs import TokensPrompt  # type: ignore
-
-    return LLM, SamplingParams, TokensPrompt
 
 
 def resolve_local_hf_snapshot(model_ref: str) -> str:
@@ -156,19 +147,6 @@ def sample_draft_tokens(generated_ids: list[int], n_token_seq_len: int, rng: ran
     return rng.choices(generated_ids, k=n_token_seq_len - 1)
 
 
-def top1_token_from_logprobs(logprobs_for_position: Any) -> int | None:
-    """Return the rank-1 token id from vLLM's per-position prompt_logprobs."""
-    if not logprobs_for_position:
-        return None
-    # Standard non-flat prompt_logprobs shape: dict[token_id, Logprob].
-    if isinstance(logprobs_for_position, dict):
-        for token_id, logprob in logprobs_for_position.items():
-            if getattr(logprob, "rank", None) == 1:
-                return int(token_id)
-        return None
-    return None
-
-
 def first_output_token(output: Any) -> int | None:
     if not output.outputs:
         return None
@@ -191,16 +169,13 @@ class VLLMJacobiScorer:
         TokensPrompt: Any,
         *,
         n_token_seq_len: int,
-        fallback_mode: str = "auto",
-        fallback_calibration_blocks: int = 2,
+        vocab_size: int | None = None,
     ) -> None:
         self.llm = llm
         self.SamplingParams = SamplingParams
         self.TokensPrompt = TokensPrompt
         self.n_token_seq_len = n_token_seq_len
-        self.fallback_mode = fallback_mode
-        self.fallback_calibration_blocks = fallback_calibration_blocks
-        self.stats = FallbackStats()
+        self.vocab_size = vocab_size
 
         self.greedy_params = SamplingParams(
             temperature=0.0,
@@ -208,100 +183,22 @@ class VLLMJacobiScorer:
             logprobs=0,
             detokenize=False,
         )
-        self.apc_prompt_logprobs_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=1,
-            prompt_logprobs=1,
-            logprobs=0,
-            detokenize=False,
-            skip_reading_prefix_cache=False,
-        )
-        self.non_apc_prompt_logprobs_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=1,
-            prompt_logprobs=1,
-            logprobs=0,
-            detokenize=False,
-            skip_reading_prefix_cache=True,
-        )
-
     def tokens_prompt(self, token_ids: Sequence[int]) -> Any:
         return self.TokensPrompt(prompt_token_ids=list(map(int, token_ids)))
 
-    def score_block_prompt_logprobs(
-        self,
-        context_ids: Sequence[int],
-        block_ids: Sequence[int],
-        *,
-        skip_reading_prefix_cache: bool,
-        method: str,
-    ) -> BlockScore:
-        full_ids = list(context_ids) + list(block_ids)
-        params = (
-            self.non_apc_prompt_logprobs_params
-            if skip_reading_prefix_cache
-            else self.apc_prompt_logprobs_params
-        )
-        start = time.perf_counter()
+    def prefill_next_tokens(self, contexts: Sequence[Sequence[int]]) -> list[int]:
         outputs = self.llm.generate(
-            [self.tokens_prompt(full_ids)],
-            sampling_params=params,
+            [self.tokens_prompt(context_ids) for context_ids in contexts],
+            sampling_params=self.greedy_params,
             use_tqdm=False,
         )
-        elapsed = time.perf_counter() - start
-        output = outputs[0]
-        prompt_logprobs = output.prompt_logprobs
-        ctx_len = len(context_ids)
-        block_len = len(block_ids)
-        if block_len < 1:
-            raise ValueError("block_ids must contain at least one token")
-        if prompt_logprobs is None:
-            raise RuntimeError(f"{method}: prompt_logprobs is None")
-        if len(prompt_logprobs) < len(full_ids):
-            raise RuntimeError(
-                f"{method}: prompt_logprobs length {len(prompt_logprobs)} < prompt length {len(full_ids)}; "
-                f"num_cached_tokens={get_num_cached_tokens(output)}"
-            )
-
-        greedy_all: list[int] = []
-        # Position ctx_len + i stores the distribution for token full_ids[ctx_len + i]
-        # conditioned on previous tokens. Read every block position so the same
-        # scoring path can bootstrap the first greedy token as well.
-        for pos in range(ctx_len, ctx_len + block_len):
-            token_id = top1_token_from_logprobs(prompt_logprobs[pos])
-            if token_id is None:
-                raise RuntimeError(
-                    f"{method}: missing rank-1 prompt logprob at pos={pos}; "
-                    f"ctx_len={ctx_len} block_len={block_len} num_cached_tokens={get_num_cached_tokens(output)}"
-                )
-            greedy_all.append(token_id)
-
-        next_token = first_output_token(output)
-        if next_token is None:
-            raise RuntimeError(f"{method}: missing generated next token")
-        greedy_all.append(next_token)
-        return BlockScore(
-            greedy_all=greedy_all,
-            method=method,
-            num_cached_tokens=get_num_cached_tokens(output),
-            elapsed_s=elapsed,
-        )
-
-    def score_block_apc_prompt_logprobs(self, context_ids: Sequence[int], block_ids: Sequence[int]) -> BlockScore:
-        return self.score_block_prompt_logprobs(
-            context_ids,
-            block_ids,
-            skip_reading_prefix_cache=False,
-            method="apc_prompt_logprobs",
-        )
-
-    def score_block_non_apc_prompt_logprobs(self, context_ids: Sequence[int], block_ids: Sequence[int]) -> BlockScore:
-        return self.score_block_prompt_logprobs(
-            context_ids,
-            block_ids,
-            skip_reading_prefix_cache=True,
-            method="non_apc_prompt_logprobs",
-        )
+        next_tokens: list[int] = []
+        for output in outputs:
+            token = first_output_token(output)
+            if token is None:
+                raise RuntimeError("prefill_next_tokens: missing generated next token")
+            next_tokens.append(int(token))
+        return next_tokens
 
     def score_block_apc_multi_prefix(self, context_ids: Sequence[int], block_ids: Sequence[int]) -> BlockScore:
         prompts = [
@@ -326,292 +223,366 @@ class VLLMJacobiScorer:
             elapsed_s=elapsed,
         )
 
-    def _record_fallback_result(self, score: BlockScore) -> None:
-        if score.method in self.stats.method_times:
-            self.stats.method_times[score.method] += score.elapsed_s
-            self.stats.method_counts[score.method] += 1
-
-    def _choose_from_calibration(self) -> str | None:
-        if self.stats.calibration_attempts < self.fallback_calibration_blocks:
-            return None
-        averages: dict[str, float] = {}
-        for method, total_time in self.stats.method_times.items():
-            count = self.stats.method_counts[method]
-            if count > 0:
-                averages[method] = total_time / count
-        if not averages:
-            return None
-        return min(averages, key=averages.get)
-
-    def score_block_fallback(self, context_ids: Sequence[int], block_ids: Sequence[int]) -> BlockScore:
-        if self.fallback_mode == "non_apc_prompt_logprobs":
-            return self.score_block_non_apc_prompt_logprobs(context_ids, block_ids)
-        if self.fallback_mode == "apc_multi_prefix":
-            return self.score_block_apc_multi_prefix(context_ids, block_ids)
-        if self.fallback_mode != "auto":
-            raise ValueError(f"Unknown fallback_mode={self.fallback_mode}")
-
-        if self.stats.chosen_method == "non_apc_prompt_logprobs":
-            return self.score_block_non_apc_prompt_logprobs(context_ids, block_ids)
-        if self.stats.chosen_method == "apc_multi_prefix":
-            return self.score_block_apc_multi_prefix(context_ids, block_ids)
-
-        non_apc_score: BlockScore | None = None
-        apc_multi_score: BlockScore | None = None
-        non_apc_error: Exception | None = None
-        apc_multi_error: Exception | None = None
-
-        try:
-            non_apc_score = self.score_block_non_apc_prompt_logprobs(context_ids, block_ids)
-            self._record_fallback_result(non_apc_score)
-        except Exception as exc:  # noqa: BLE001 - report and try the other fallback.
-            non_apc_error = exc
-
-        try:
-            apc_multi_score = self.score_block_apc_multi_prefix(context_ids, block_ids)
-            self._record_fallback_result(apc_multi_score)
-        except Exception as exc:  # noqa: BLE001 - report and try the other fallback.
-            apc_multi_error = exc
-
-        if non_apc_score is None and apc_multi_score is None:
-            raise RuntimeError(
-                "Both fallback modes failed: "
-                f"non_apc_prompt_logprobs={non_apc_error!r}; apc_multi_prefix={apc_multi_error!r}"
-            )
-        if non_apc_score is not None and apc_multi_score is not None:
-            if non_apc_score.greedy_all != apc_multi_score.greedy_all:
-                self.stats.mismatches += 1
-                # Prefer the mathematically direct full-prompt scoring path when
-                # the fallback methods disagree; it recomputes prompt logprobs.
-                # Also pin future auto fallbacks to this conservative method; a
-                # faster multi-prefix path is not useful if it disagrees.
-                self.stats.calibration_attempts += 1
-                self.stats.chosen_method = "non_apc_prompt_logprobs"
-                return non_apc_score
-
-            chosen = non_apc_score if non_apc_score.elapsed_s <= apc_multi_score.elapsed_s else apc_multi_score
-            self.stats.calibration_attempts += 1
-            self.stats.chosen_method = self._choose_from_calibration()
-            return chosen
-
-        chosen = non_apc_score or apc_multi_score
-        assert chosen is not None
-        self.stats.calibration_attempts += 1
-        self.stats.chosen_method = chosen.method
-        return chosen
-
     def score_block(self, context_ids: Sequence[int], block_ids: Sequence[int]) -> tuple[BlockScore, str | None]:
-        try:
-            return self.score_block_apc_prompt_logprobs(context_ids, block_ids), None
-        except Exception as exc:  # noqa: BLE001 - fallback is intentional here.
-            fallback = self.score_block_fallback(context_ids, block_ids)
-            return fallback, str(exc)
+        return self.score_block_apc_multi_prefix(context_ids, block_ids), None
 
-    def bootstrap_first_token(self, context_ids: Sequence[int], draft_token: int) -> tuple[int, dict[str, Any]]:
-        score, fallback_reason = self.score_block(context_ids, [int(draft_token)])
-        if not score.greedy_all:
-            raise RuntimeError("bootstrap_first_token: missing greedy token for first block position")
-        return int(score.greedy_all[0]), {
-            "method": score.method,
-            "fallback_reason": fallback_reason,
-            "num_cached_tokens": score.num_cached_tokens,
-            "elapsed_s": score.elapsed_s,
-            "bootstrap": True,
-        }
+    def score_blocks(
+        self,
+        contexts_and_blocks: Sequence[tuple[Sequence[int], Sequence[int]]],
+    ) -> list[tuple[BlockScore, str | None]]:
+        return [(self.score_block_apc_multi_prefix(context_ids, block_ids), None) for context_ids, block_ids in contexts_and_blocks]
 
 
-def run_jacobi_block(
+def initialize_jacobi_block_states(
+    prompt_states: Sequence[PromptGenerationState],
     scorer: VLLMJacobiScorer,
-    context_ids: list[int],
     n_token_seq_len: int,
-    tokenizer,
-    rng: random.Random,
-) -> tuple[int, list[list[int]], list[dict[str, Any]]]:
-    seed_token = context_ids[-1]
-    first_correct_token, bootstrap_diag = scorer.bootstrap_first_token(context_ids, seed_token)
-    block = [int(first_correct_token)] + sample_draft_tokens(context_ids, n_token_seq_len, rng)
-    accepted_n_gram = list(block)
-    answer_trajectory_ids = [list(block)]
-    total_accepted = 0
-    next_token = int(first_correct_token)
-    diagnostics: list[dict[str, Any]] = [bootstrap_diag]
-    score_context = list(context_ids)
-
-    while total_accepted < n_token_seq_len:
-        # `score_context` tracks the original context plus the prefix accepted
-        # inside this Jacobi block. This mirrors the HF implementation's
-        # past_key_values after cache cropping: subsequent refinement passes are
-        # conditioned on accepted tokens, not only on the pre-block context.
-        score, fallback_reason = scorer.score_block(score_context, block)
-        greedy_all = score.greedy_all
-        greedy_tokens = greedy_all[:-1]
-        next_after_block = greedy_all[-1]
-        if len(greedy_tokens) != len(block):
-            raise RuntimeError(
-                f"greedy token count mismatch: got {len(greedy_tokens)} expected {len(block)}"
+) -> list[JacobiBlockState]:
+    first_tokens = scorer.prefill_next_tokens([state.generated_ids for state in prompt_states])
+    block_states: list[JacobiBlockState] = []
+    for state, first_correct_token in zip(prompt_states, first_tokens):
+        block = [int(first_correct_token)] + sample_draft_tokens(state.generated_ids, n_token_seq_len, state.rng)
+        block_states.append(
+            JacobiBlockState(
+                prompt_state=state,
+                prompt_ids_for_record=list(state.generated_ids),
+                block=block,
+                accepted_n_gram=list(block),
+                answer_trajectory_ids=[list(block)],
+                diagnostics=[
+                    {
+                        "method": "prefill_greedy",
+                        "num_cached_tokens": 0,
+                        "elapsed_s": 0.0,
+                        "bootstrap": True,
+                    }
+                ],
+                score_context=list(state.generated_ids),
+                next_token=int(first_correct_token),
             )
+        )
+    return block_states
 
-        mismatch_idx: int | None = None
-        for idx, (draft_token, greedy_token) in enumerate(zip(block, greedy_tokens)):
-            if int(draft_token) != int(greedy_token):
-                mismatch_idx = idx
-                break
-        num_accepted_raw = (len(block) if mismatch_idx is None else mismatch_idx)
 
-        eos_id = tokenizer.eos_token_id
-        num_accepted = num_accepted_raw
-        if eos_id is not None:
-            for idx, token in enumerate(block[:num_accepted_raw]):
-                if int(token) == int(eos_id):
-                    num_accepted = idx + 1
-                    break
-
-        if num_accepted > 0:
-            accepted_n_gram[total_accepted : total_accepted + num_accepted] = block[:num_accepted]
-        total_accepted += num_accepted
-        diagnostics.append(
-            {
-                "method": score.method,
-                "fallback_reason": fallback_reason,
-                "num_cached_tokens": score.num_cached_tokens,
-                "elapsed_s": score.elapsed_s,
-                "num_accepted_raw": num_accepted_raw,
-                "num_accepted": num_accepted,
-            }
+def advance_jacobi_block_state(
+    block_state: JacobiBlockState,
+    score: BlockScore,
+    tokenizer,
+    n_token_seq_len: int,
+) -> bool:
+    greedy_all = score.greedy_all
+    greedy_tokens = greedy_all[:-1]
+    next_after_block = greedy_all[-1]
+    block = block_state.block
+    if len(greedy_tokens) != len(block) - 1:
+        raise RuntimeError(
+            f"greedy token count mismatch: got {len(greedy_tokens)} expected {len(block) - 1}"
         )
 
-        if eos_id is not None and any(int(token) == int(eos_id) for token in block[:num_accepted]):
-            next_token = int(eos_id)
-            return next_token, answer_trajectory_ids, diagnostics
+    mismatch_idx: int | None = None
+    for idx, (draft_token, greedy_token) in enumerate(zip(block[1:], greedy_tokens)):
+        if int(draft_token) != int(greedy_token):
+            mismatch_idx = idx
+            break
+    num_accepted_raw = (len(block) if mismatch_idx is None else mismatch_idx + 1)
 
-        has_rejected = num_accepted_raw < len(block)
-        if has_rejected:
-            next_token = int(greedy_tokens[num_accepted_raw])
-            if eos_id is not None and next_token == int(eos_id):
-                if total_accepted < len(accepted_n_gram):
-                    accepted_n_gram[total_accepted : total_accepted + 1] = [next_token]
-                total_accepted += 1
-                answer_trajectory_ids.append(accepted_n_gram[: min(total_accepted, n_token_seq_len)])
-                return next_token, answer_trajectory_ids, diagnostics
+    eos_id = tokenizer.eos_token_id
+    num_accepted = num_accepted_raw
+    if eos_id is not None:
+        for idx, token in enumerate(block[:num_accepted_raw]):
+            if int(token) == int(eos_id):
+                num_accepted = idx + 1
+                break
 
-            remaining_greedy = [int(tok) for tok in greedy_tokens[num_accepted_raw + 1 :]]
-            block = [next_token] + remaining_greedy
-            score_context = list(context_ids) + accepted_n_gram[:total_accepted]
-            answer_trajectory_ids.append(accepted_n_gram[:total_accepted] + block)
-            continue
+    if num_accepted > 0:
+        block_state.accepted_n_gram[
+            block_state.total_accepted : block_state.total_accepted + num_accepted
+        ] = block[:num_accepted]
+    block_state.total_accepted += num_accepted
+    block_state.diagnostics.append(
+        {
+            "method": score.method,
+            "num_cached_tokens": score.num_cached_tokens,
+            "elapsed_s": score.elapsed_s,
+            "num_accepted_raw": num_accepted_raw,
+            "num_accepted": num_accepted,
+        }
+    )
 
-        next_token = int(next_after_block)
-        if total_accepted < len(accepted_n_gram):
-            accepted_n_gram[total_accepted : total_accepted + 1] = [next_token]
-        if eos_id is not None and next_token == int(eos_id):
-            total_accepted += 1
-            answer_trajectory_ids.append(accepted_n_gram[: min(total_accepted, n_token_seq_len)])
-            return next_token, answer_trajectory_ids, diagnostics
+    if eos_id is not None and any(int(token) == int(eos_id) for token in block[:num_accepted]):
+        block_state.next_token = int(eos_id)
+        return True
 
-        total_accepted += 1
-        answer_trajectory_ids.append(accepted_n_gram[: min(total_accepted, n_token_seq_len)])
+    has_rejected = num_accepted_raw < len(block)
+    if has_rejected:
+        block_state.next_token = int(greedy_tokens[num_accepted_raw - 1])
+        if eos_id is not None and block_state.next_token == int(eos_id):
+            if block_state.total_accepted < len(block_state.accepted_n_gram):
+                block_state.accepted_n_gram[
+                    block_state.total_accepted : block_state.total_accepted + 1
+                ] = [block_state.next_token]
+            block_state.total_accepted += 1
+            block_state.answer_trajectory_ids.append(
+                block_state.accepted_n_gram[: min(block_state.total_accepted, n_token_seq_len)]
+            )
+            return True
 
-    return next_token, answer_trajectory_ids, diagnostics
+        remaining_greedy = [int(tok) for tok in greedy_tokens[num_accepted_raw:]]
+        block_state.block = [block_state.next_token] + remaining_greedy
+        block_state.score_context = list(block_state.prompt_state.generated_ids) + block_state.accepted_n_gram[
+            : block_state.total_accepted
+        ]
+        block_state.answer_trajectory_ids.append(
+            block_state.accepted_n_gram[:block_state.total_accepted] + block_state.block
+        )
+        return False
+
+    block_state.next_token = int(next_after_block)
+    if block_state.total_accepted < len(block_state.accepted_n_gram):
+        block_state.accepted_n_gram[block_state.total_accepted : block_state.total_accepted + 1] = [
+            block_state.next_token
+        ]
+    if eos_id is not None and block_state.next_token == int(eos_id):
+        block_state.total_accepted += 1
+        block_state.answer_trajectory_ids.append(
+            block_state.accepted_n_gram[: min(block_state.total_accepted, n_token_seq_len)]
+        )
+        return True
+
+    block_state.total_accepted += 1
+    block_state.answer_trajectory_ids.append(
+        block_state.accepted_n_gram[: min(block_state.total_accepted, n_token_seq_len)]
+    )
+    return block_state.total_accepted >= n_token_seq_len
 
 
-def process_record(
+def run_jacobi_blocks_batched(
+    prompt_states: Sequence[PromptGenerationState],
+    scorer: VLLMJacobiScorer,
+    n_token_seq_len: int,
+    tokenizer,
+) -> list[JacobiBlockState]:
+    pending = initialize_jacobi_block_states(prompt_states, scorer, n_token_seq_len)
+    completed: list[JacobiBlockState] = []
+    while pending:
+        score_results = scorer.score_blocks(
+            [(block_state.score_context, block_state.block) for block_state in pending]
+        )
+        next_pending: list[JacobiBlockState] = []
+        for block_state, (score, _) in zip(pending, score_results):
+            done = advance_jacobi_block_state(
+                block_state=block_state,
+                score=score,
+                tokenizer=tokenizer,
+                n_token_seq_len=n_token_seq_len,
+            )
+            if done:
+                completed.append(block_state)
+            else:
+                next_pending.append(block_state)
+        pending = next_pending
+    return completed
+
+
+def initialize_prompt_state(
     record: dict[str, Any],
     record_idx: int,
+    tokenizer,
+    chat_template_mode: str,
+    seed: int,
+) -> tuple[PromptGenerationState | None, list[dict[str, Any]]]:
+    data_id = str(record.get("data_id", f"data_{record_idx}"))
+    prompt = record.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None, [{"data_id": data_id, "reason": "missing_prompt"}]
+
+    try:
+        input_ids = encode_prompt(tokenizer, prompt, chat_template_mode)
+    except Exception as exc:  # noqa: BLE001
+        return None, [{"data_id": data_id, "reason": "tokenization_failed", "error": repr(exc)}]
+
+    if not input_ids:
+        return None, [{"data_id": data_id, "reason": "empty_prompt_after_tokenization"}]
+
+    return (
+        PromptGenerationState(
+            record_idx=record_idx,
+            data_id=data_id,
+            input_ids=list(input_ids),
+            generated_ids=list(input_ids),
+            rng=random.Random(seed + record_idx),
+        ),
+        [],
+    )
+
+
+def process_records_batched(
+    records: Sequence[dict[str, Any]],
     scorer: VLLMJacobiScorer,
     tokenizer,
     n_token_seq_len: int,
     max_new_seq_len: int,
     chat_template_mode: str,
     seed: int,
-    include_diagnostics: bool,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    data_id = str(record.get("data_id", f"data_{record_idx}"))
-    prompt = record.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        return [], [{"data_id": data_id, "reason": "missing_prompt"}]
+    data_bos_id: int,
+    output_file: str,
+    skip_file: str,
+    max_active_prompts: int = 0,
+) -> tuple[int, int]:
+    prompt_states: list[PromptGenerationState] = []
+    num_generated_records = 0
+    num_skipped_records = 0
+    for local_idx, record in enumerate(records):
+        prompt_state, init_skips = initialize_prompt_state(
+            record=record,
+            record_idx=local_idx + data_bos_id,
+            tokenizer=tokenizer,
+            chat_template_mode=chat_template_mode,
+            seed=seed,
+        )
+        if prompt_state is not None:
+            prompt_states.append(prompt_state)
+        if init_skips:
+            with open(skip_file, "a", encoding="utf-8") as fout:
+                for skip_record in init_skips:
+                    fout.write(json.dumps(skip_record, ensure_ascii=False) + "\n")
+            num_skipped_records += len(init_skips)
 
-    skip_records: list[dict[str, Any]] = []
-    try:
-        input_ids = encode_prompt(tokenizer, prompt, chat_template_mode)
-    except Exception as exc:  # noqa: BLE001
-        return [], [{"data_id": data_id, "reason": "tokenization_failed", "error": repr(exc)}]
+    pending_states = list(prompt_states)
+    max_active = max_active_prompts if max_active_prompts > 0 else len(pending_states)
+    progress = tqdm(total=len(pending_states), desc="Generating vLLM trajectories")
+    active_states: list[PromptGenerationState] = []
 
-    if not input_ids:
-        return [], [{"data_id": data_id, "reason": "empty_prompt_after_tokenization"}]
+    while pending_states or active_states:
+        while pending_states and len(active_states) < max_active:
+            active_states.append(pending_states.pop(0))
 
-    generated_ids = list(input_ids)
-    iterations = 0
-    per_iteration_records: list[dict[str, Any]] = []
-    rng = random.Random(seed + record_idx)
+        ready_states: list[PromptGenerationState] = []
+        next_active_states: list[PromptGenerationState] = []
+        for state in active_states:
+            generated_part = state.generated_ids[len(state.input_ids) :]
+            if tokenizer.eos_token_id is not None and int(tokenizer.eos_token_id) in generated_part:
+                progress.update(1)
+                continue
+            if state.iterations * n_token_seq_len >= max_new_seq_len:
+                progress.update(1)
+                continue
+            ready_states.append(state)
 
-    while True:
-        generated_part = generated_ids[len(input_ids) :]
-        if tokenizer.eos_token_id is not None and int(tokenizer.eos_token_id) in generated_part:
-            break
-        if iterations * n_token_seq_len >= max_new_seq_len:
-            break
+        if not ready_states:
+            active_states = next_active_states
+            continue
 
-        prompt_ids_for_record = list(generated_ids)
         try:
-            next_token, answer_trajectory_ids, diagnostics = run_jacobi_block(
+            completed_blocks = run_jacobi_blocks_batched(
+                prompt_states=ready_states,
                 scorer=scorer,
-                context_ids=generated_ids,
                 n_token_seq_len=n_token_seq_len,
                 tokenizer=tokenizer,
-                rng=rng,
             )
         except Exception as exc:  # noqa: BLE001
-            append_skip(
-                skip_records,
-                data_id,
-                "jacobi_block_failed",
-                diffusion_itr_id=f"itr_{iterations}",
-                error=repr(exc),
-            )
-            break
+            batch_skip_rows: list[dict[str, Any]] = []
+            for state in ready_states:
+                record = {"data_id": state.data_id, "reason": "jacobi_block_failed"}
+                record.update(
+                    {
+                        "diffusion_itr_id": f"itr_{state.iterations}",
+                        "error": repr(exc),
+                    }
+                )
+                batch_skip_rows.append(record)
+                progress.update(1)
+            if batch_skip_rows:
+                with open(skip_file, "a", encoding="utf-8") as fout:
+                    for skip_record in batch_skip_rows:
+                        fout.write(json.dumps(skip_record, ensure_ascii=False) + "\n")
+                num_skipped_records += len(batch_skip_rows)
+            active_states = next_active_states
+            continue
 
-        if not answer_trajectory_ids:
-            append_skip(skip_records, data_id, "empty_answer_trajectory", diffusion_itr_id=f"itr_{iterations}")
-            break
+        block_by_record_idx = {block_state.prompt_state.record_idx: block_state for block_state in completed_blocks}
+        batch_output_rows: list[dict[str, Any]] = []
+        batch_skip_rows: list[dict[str, Any]] = []
+        for state in ready_states:
+            block_state = block_by_record_idx.get(state.record_idx)
+            if block_state is None:
+                record = {"data_id": state.data_id, "reason": "missing_batched_block_result"}
+                record.update({"diffusion_itr_id": f"itr_{state.iterations}"})
+                batch_skip_rows.append(record)
+                progress.update(1)
+                continue
 
-        final_block = answer_trajectory_ids[-1]
-        final_block_len = len(final_block)
-        if final_block_len != n_token_seq_len:
-            append_skip(
-                skip_records,
-                data_id,
-                "short_final_block",
-                diffusion_itr_id=f"itr_{iterations}",
-                final_block_len=final_block_len,
-                expected_block_len=n_token_seq_len,
-            )
-            break
+            answer_trajectory_ids = block_state.answer_trajectory_ids
+            if not answer_trajectory_ids:
+                record = {"data_id": state.data_id, "reason": "empty_answer_trajectory"}
+                record.update({"diffusion_itr_id": f"itr_{state.iterations}"})
+                batch_skip_rows.append(record)
+                progress.update(1)
+                continue
 
-        generated_ids.extend(final_block)
-        row: dict[str, Any] = {
-            "diffusion_itr_id": f"itr_{iterations}",
-            "data_id": data_id,
-            "prompt_ids": [prompt_ids_for_record],
-            "answer_trajectory_ids": answer_trajectory_ids,
-        }
-        if include_diagnostics:
-            row["vllm_diagnostics"] = diagnostics
-        per_iteration_records.append(row)
-        iterations += 1
+            final_block = answer_trajectory_ids[-1]
+            final_block_len = len(final_block)
+            if final_block_len != n_token_seq_len:
+                record = {"data_id": state.data_id, "reason": "short_final_block"}
+                record.update(
+                    {
+                        "diffusion_itr_id": f"itr_{state.iterations}",
+                        "final_block_len": final_block_len,
+                        "expected_block_len": n_token_seq_len,
+                    }
+                )
+                batch_skip_rows.append(record)
+                progress.update(1)
+                continue
 
-    if not per_iteration_records:
-        if not skip_records:
-            append_skip(skip_records, data_id, "no_valid_iterations")
-        return [], skip_records
+            state.generated_ids.extend(final_block)
+            row: dict[str, Any] = {
+                "diffusion_itr_id": f"itr_{state.iterations}",
+                "data_id": state.data_id,
+                "prompt_ids": [block_state.prompt_ids_for_record],
+                "answer_trajectory_ids": answer_trajectory_ids,
+                "vllm_diagnostics": block_state.diagnostics,
+                "teacher_output_ids": list(state.generated_ids),
+            }
+            batch_output_rows.append(row)
+            state.iterations += 1
 
-    teacher_output_ids = list(generated_ids)
-    for iteration_record in per_iteration_records:
-        iteration_record["teacher_output_ids"] = teacher_output_ids
+            generated_part = state.generated_ids[len(state.input_ids) :]
+            if tokenizer.eos_token_id is not None and int(tokenizer.eos_token_id) in generated_part:
+                progress.update(1)
+                continue
+            if state.iterations * n_token_seq_len >= max_new_seq_len:
+                progress.update(1)
+                continue
+            next_active_states.append(state)
 
-    return per_iteration_records, skip_records
+        active_states = next_active_states
+
+        if batch_output_rows:
+            with open(output_file, "a", encoding="utf-8") as fout:
+                for row in batch_output_rows:
+                    fout.write(json.dumps(row, ensure_ascii=False) + "\n")
+            num_generated_records += len(batch_output_rows)
+        if batch_skip_rows:
+            with open(skip_file, "a", encoding="utf-8") as fout:
+                for skip_record in batch_skip_rows:
+                    fout.write(json.dumps(skip_record, ensure_ascii=False) + "\n")
+            num_skipped_records += len(batch_skip_rows)
+
+    progress.close()
+    return num_generated_records, num_skipped_records
+
+
+def build_cudagraph_capture_sizes(n_token_seq_len: int, max_active_prompts: int) -> list[int]:
+    max_capture_size = max(1, n_token_seq_len * max(1, max_active_prompts))
+    return list(range(1, max_capture_size + 1))
 
 
 def build_llm_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    cudagraph_capture_sizes = build_cudagraph_capture_sizes(
+        args.n_token_seq_len,
+        args.max_active_prompts,
+    )
     kwargs: dict[str, Any] = {
         "model": args.model,
         "tokenizer": args.tokenizer_path,
@@ -626,6 +597,11 @@ def build_llm_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "disable_log_stats": False,
         "logits_processors": args.logits_processors or None,
         "logprobs_mode": args.logprobs_mode,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "compilation_config": {
+            "cudagraph_capture_sizes": cudagraph_capture_sizes,
+            "max_cudagraph_capture_size": cudagraph_capture_sizes[-1],
+        },
     }
     if args.max_model_len > 0:
         kwargs["max_model_len"] = args.max_model_len
@@ -636,7 +612,6 @@ def build_llm_kwargs(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(args: argparse.Namespace) -> None:
     set_random_seed(args.seed)
-    LLM, SamplingParams, TokensPrompt = import_vllm(args.vllm_repo)
 
     args.model = resolve_local_hf_snapshot(args.model)
     args.tokenizer_path = resolve_local_hf_snapshot(args.tokenizer_path)
@@ -661,8 +636,7 @@ def main(args: argparse.Namespace) -> None:
         SamplingParams,
         TokensPrompt,
         n_token_seq_len=args.n_token_seq_len,
-        fallback_mode=args.fallback_mode,
-        fallback_calibration_blocks=args.fallback_calibration_blocks,
+        vocab_size=len(tokenizer),
     )
 
     records = load_records(
@@ -671,30 +645,13 @@ def main(args: argparse.Namespace) -> None:
         end=None if int(args.data_eos_id) < 0 else int(args.data_eos_id),
     )
 
-    generated_records: list[dict[str, Any]] = []
-    skip_records: list[dict[str, Any]] = []
-    for local_idx, record in enumerate(tqdm(records, desc="Generating vLLM trajectories", total=len(records))):
-        sample_records, sample_skips = process_record(
-            record=record,
-            record_idx=local_idx + int(args.data_bos_id),
-            scorer=scorer,
-            tokenizer=tokenizer,
-            n_token_seq_len=args.n_token_seq_len,
-            max_new_seq_len=args.max_new_seq_len,
-            chat_template_mode=args.chat_template_mode,
-            seed=args.seed,
-            include_diagnostics=args.include_diagnostics,
-        )
-        generated_records.extend(sample_records)
-        skip_records.extend(sample_skips)
-
     os.makedirs(args.save_path, exist_ok=True)
     stem = Path(args.filename).stem
     range_suffix = f"{int(args.data_bos_id)}_{int(args.data_eos_id)}"
     model_family = "solar"
     output_file = os.path.join(
         args.save_path,
-        f"{stem}_{args.chat_template_mode}_{model_family}_vllm_greedy_jacobi_len{args.n_token_seq_len}_{range_suffix}.json",
+        f"{stem}_{args.chat_template_mode}_{model_family}_vllm_greedy_jacobi_len{args.n_token_seq_len}_{range_suffix}.jsonl",
     )
     skip_file = os.path.join(
         args.save_path,
@@ -705,33 +662,40 @@ def main(args: argparse.Namespace) -> None:
         f"{stem}_{args.chat_template_mode}_{model_family}_vllm_greedy_jacobi_len{args.n_token_seq_len}_{range_suffix}_stats.json",
     )
 
-    with open(output_file, "w", encoding="utf-8") as fout:
-        json.dump(generated_records, fout, ensure_ascii=False)
-    with open(skip_file, "w", encoding="utf-8") as fout:
-        for skip_record in skip_records:
-            fout.write(json.dumps(skip_record, ensure_ascii=False) + "\n")
+    open(output_file, "w", encoding="utf-8").close()
+    open(skip_file, "w", encoding="utf-8").close()
+
+    num_generated_records, num_skipped_records = process_records_batched(
+        records=records,
+        scorer=scorer,
+        tokenizer=tokenizer,
+        n_token_seq_len=args.n_token_seq_len,
+        max_new_seq_len=args.max_new_seq_len,
+        chat_template_mode=args.chat_template_mode,
+        seed=args.seed,
+        data_bos_id=int(args.data_bos_id),
+        output_file=output_file,
+        skip_file=skip_file,
+        max_active_prompts=args.max_active_prompts,
+    )
+
     with open(stats_file, "w", encoding="utf-8") as fout:
         json.dump(
             {
-                "fallback": {
-                    "mode": args.fallback_mode,
-                    "chosen_method": scorer.stats.chosen_method,
-                    "method_times": scorer.stats.method_times,
-                    "method_counts": scorer.stats.method_counts,
-                    "calibration_attempts": scorer.stats.calibration_attempts,
-                    "mismatches": scorer.stats.mismatches,
+                "scoring": {
+                    "mode": "apc_multi_prefix",
                 },
-                "num_generated_records": len(generated_records),
-                "num_skipped_records": len(skip_records),
+                "num_generated_records": num_generated_records,
+                "num_skipped_records": num_skipped_records,
             },
             fout,
             ensure_ascii=False,
             indent=2,
         )
 
-    print(f"Wrote {len(generated_records)} trajectory records to {output_file}")
-    print(f"Wrote {len(skip_records)} skip records to {skip_file}")
-    print(f"Wrote fallback stats to {stats_file}")
+    print(f"Wrote {num_generated_records} trajectory records to {output_file}")
+    print(f"Wrote {num_skipped_records} skip records to {skip_file}")
+    print(f"Wrote stats to {stats_file}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -756,10 +720,11 @@ def parse_args() -> argparse.Namespace:
         "--logprobs_mode",
         default="processed_logprobs",
         choices=["raw_logprobs", "processed_logprobs", "raw_logits", "processed_logits"],
-        help="Use processed_logprobs by default so prompt_logprobs match global Solar logits processors.",
+        help="Use processed_logprobs by default so Solar logits processors stay aligned.",
     )
     parser.add_argument("--enforce_eager", action="store_true")
-    parser.add_argument("--vllm_repo", default=os.environ.get("VLLM_REPO"))
+    parser.add_argument("--max_num_batched_tokens", type=int, default=16384)
+    parser.add_argument("--max_active_prompts", type=int, default=16)
     parser.add_argument(
         "--logits_processors",
         action="append",
@@ -769,13 +734,6 @@ def parse_args() -> argparse.Namespace:
         ],
         help="Global vLLM logits processor class path. Repeat to pass multiple; defaults match Solar-Open HF vLLM guide.",
     )
-    parser.add_argument(
-        "--fallback_mode",
-        choices=["auto", "non_apc_prompt_logprobs", "apc_multi_prefix"],
-        default="auto",
-    )
-    parser.add_argument("--fallback_calibration_blocks", type=int, default=2)
-    parser.add_argument("--include_diagnostics", action="store_true")
     return parser.parse_args()
 
 
